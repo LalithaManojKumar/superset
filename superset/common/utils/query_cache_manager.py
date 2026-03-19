@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import logging
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Generator
 
 from flask import current_app
 from flask_caching import Cache
@@ -40,6 +42,106 @@ _cache: dict[CacheRegion, Cache] = {
     CacheRegion.DEFAULT: cache_manager.cache,
     CacheRegion.DATA: cache_manager.data_cache,
 }
+
+# ---------------------------------------------------------------------------
+# Single-flight / in-flight deduplication
+# ---------------------------------------------------------------------------
+# These module-level structures provide *within-process* single-flight
+# protection for query execution.
+#
+# Problem this solves (thundering-herd / dogpile):
+#   When a dashboard loads with N charts that share the same datasource and
+#   filters, each chart independently POSTs to /api/v1/chart/data.  All N
+#   requests reach get_df_payload() at roughly the same time and see a cache
+#   miss (the first request hasn't finished yet).  Without a guard they all
+#   execute the identical SQL query against the database.
+#
+# How it works:
+# ---------------------------------------------------------------------------
+#   The first thread to see a cache miss for a given cache_key acquires
+#   "ownership" by inserting a threading.Event into _inflight_events and
+#   yields is_first=True.  Subsequent threads that want the same key find the
+#   Event already there, yield is_first=False, and block on event.wait().
+#   Once the first thread completes (success *or* failure) it fires the Event
+#   so that all waiters are unblocked and can re-read from cache.
+#
+# Scope and limitations:
+#   * Only protects threads within the same worker process (e.g. Gunicorn
+#     threaded or gevent worker).  Across separate processes the shared cache
+#     (Redis / Memcached) already provides eventual consistency – the second
+#     process to finish a query will simply overwrite the cached value with an
+#     identical result, which is harmless.
+#   * force_query=True bypasses the guard intentionally: the user has
+#     explicitly requested fresh data, so we should not coalesce that request.
+# ---------------------------------------------------------------------------
+# All reads and writes to _inflight_events MUST be done while holding
+# _inflight_lock to avoid TOCTOU races.  The lock is intentionally
+# short-held: we only hold it for the dictionary operation, then release it
+# before any blocking (event.wait) or yielding to caller code.
+_inflight_events: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
+
+#: How long (seconds) a waiter will block before giving up and executing the
+#: query itself.  Acts as a safety valve so a slow/hung query never locks
+#: other threads indefinitely.  Should be set conservatively higher than the
+#: expected worst-case query duration.  Not currently user-configurable, but
+#: can be overridden in tests by monkey-patching this module attribute.
+_INFLIGHT_WAIT_TIMEOUT_S = 60
+
+
+@contextmanager
+def inflight_guard(
+    cache_key: str | None,
+) -> Generator[bool, None, None]:
+    """Single-flight context manager for query execution.
+
+    Yields ``True`` (is_first) when the caller should execute the query.
+    Yields ``False`` when another thread is already executing the same query;
+    in this case the caller should wait (the wait happens inside the manager)
+    and then re-check the cache rather than executing a redundant query.
+
+    When *cache_key* is ``None`` (e.g. force_query mode or no key available)
+    the guard is a no-op and always yields ``True`` so the caller executes
+    unconditionally.
+
+    Usage::
+
+        with inflight_guard(cache_key) as is_first:
+            if not is_first:
+                cache = QueryCacheManager.get(key=cache_key, ...)
+            if is_first or not cache.is_loaded:
+                query_result = run_expensive_query()
+                cache.set_query_result(key=cache_key, ...)
+    """
+    if not cache_key:
+        yield True
+        return
+
+    with _inflight_lock:
+        if cache_key in _inflight_events:
+            event = _inflight_events[cache_key]
+            is_first = False
+        else:
+            event = threading.Event()
+            _inflight_events[cache_key] = event
+            is_first = True
+
+    if not is_first:
+        logger.debug(
+            "Single-flight: waiting for in-flight query with cache key: %s", cache_key
+        )
+        event.wait(timeout=_INFLIGHT_WAIT_TIMEOUT_S)
+        yield False
+        return
+
+    # We are the first thread for this cache key.
+    try:
+        yield True
+    finally:
+        # Unblock all waiters and remove our entry regardless of outcome.
+        with _inflight_lock:
+            _inflight_events.pop(cache_key, None)
+        event.set()
 
 
 class QueryCacheManager:

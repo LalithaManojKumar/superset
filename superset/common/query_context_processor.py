@@ -27,7 +27,7 @@ from flask_babel import gettext as _
 from superset.common.chart_data import ChartDataResultFormat
 from superset.common.db_query_status import QueryStatus
 from superset.common.query_actions import get_query_results
-from superset.common.utils.query_cache_manager import QueryCacheManager
+from superset.common.utils.query_cache_manager import inflight_guard, QueryCacheManager
 from superset.common.utils.time_range_utils import get_since_until_from_time_range
 from superset.constants import CACHE_DISABLED_TIMEOUT, CacheRegion
 from superset.daos.annotation_layer import AnnotationLayerDAO
@@ -111,37 +111,56 @@ class QueryContextProcessor:
             cache.is_loaded = False
 
         if query_obj and cache_key and not cache.is_loaded:
-            try:
-                if invalid_columns := [
-                    col
-                    for col in get_column_names_from_columns(query_obj.columns)
-                    + get_column_names_from_metrics(query_obj.metrics or [])
-                    if (
-                        col not in self._qc_datasource.column_names
-                        and col != DTTM_ALIAS
-                    )
-                ]:
-                    raise QueryObjectValidationError(
-                        _(
-                            "Columns missing in dataset: %(invalid_columns)s",
-                            invalid_columns=invalid_columns,
-                        )
+            # Single-flight guard: when multiple threads see the same cache miss
+            # concurrently (e.g. N charts in a dashboard sharing the same query),
+            # only the first thread executes the SQL query.  All others wait for
+            # the Event to be signalled and then re-read the result from cache.
+            # On force_query the guard is a no-op so each refresh executes fresh.
+            # guard_key=None bypasses the guard for force_query (explicit refresh
+            # requested by the user should never be coalesced with other requests).
+            guard_key = None if force_query else cache_key
+            with inflight_guard(guard_key) as is_first:
+                if not is_first:
+                    # Re-read cache populated by the first thread.
+                    cache = QueryCacheManager.get(
+                        key=cache_key,
+                        region=CacheRegion.DATA,
+                        force_query=False,
+                        force_cached=force_cached,
                     )
 
-                query_result = self.get_query_result(query_obj)
-                annotation_data = self.get_annotation_data(query_obj)
-                cache.set_query_result(
-                    key=cache_key,
-                    query_result=query_result,
-                    annotation_data=annotation_data,
-                    force_query=force_query,
-                    timeout=self.get_cache_timeout(),
-                    datasource_uid=self._qc_datasource.uid,
-                    region=CacheRegion.DATA,
-                )
-            except QueryObjectValidationError as ex:
-                cache.error_message = str(ex)
-                cache.status = QueryStatus.FAILED
+                if is_first or not cache.is_loaded:
+                    try:
+                        if invalid_columns := [
+                            col
+                            for col in get_column_names_from_columns(query_obj.columns)
+                            + get_column_names_from_metrics(query_obj.metrics or [])
+                            if (
+                                col not in self._qc_datasource.column_names
+                                and col != DTTM_ALIAS
+                            )
+                        ]:
+                            raise QueryObjectValidationError(
+                                _(
+                                    "Columns missing in dataset: %(invalid_columns)s",
+                                    invalid_columns=invalid_columns,
+                                )
+                            )
+
+                        query_result = self.get_query_result(query_obj)
+                        annotation_data = self.get_annotation_data(query_obj)
+                        cache.set_query_result(
+                            key=cache_key,
+                            query_result=query_result,
+                            annotation_data=annotation_data,
+                            force_query=force_query,
+                            timeout=self.get_cache_timeout(),
+                            datasource_uid=self._qc_datasource.uid,
+                            region=CacheRegion.DATA,
+                        )
+                    except QueryObjectValidationError as ex:
+                        cache.error_message = str(ex)
+                        cache.status = QueryStatus.FAILED
 
         # the N-dimensional DataFrame has converted into flat DataFrame
         # by `flatten operator`, "comma" in the column is escaped by `escape_separator`
