@@ -129,6 +129,18 @@ class QueryContextProcessor:
                         force_query=False,
                         force_cached=force_cached,
                     )
+                    # --- Observability: dedupe effectiveness -------------------
+                    # Emit whether the wait paid off.  A high ratio of
+                    # cache_hit_after_wait / deduped means deduplication is
+                    # genuinely saving work.  A high cache_miss_after_wait
+                    # means the winner failed before writing cache, so waiters
+                    # blocked AND still need to re-execute — pure added latency.
+                    _stats_logger = current_app.config.get("STATS_LOGGER")
+                    if _stats_logger is not None:
+                        if cache.is_loaded:
+                            _stats_logger.incr("inflight_guard.cache_hit_after_wait")
+                        else:
+                            _stats_logger.incr("inflight_guard.cache_miss_after_wait")
 
                 if is_first or not cache.is_loaded:
                     try:

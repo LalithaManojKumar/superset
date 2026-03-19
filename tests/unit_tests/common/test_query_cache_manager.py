@@ -1031,3 +1031,146 @@ def test_lock_wait_ms_timing_emitted_for_every_thread(monkeypatch):
     assert all(v >= 0 for v in lock_wait_values), (
         f"inflight_guard.lock_wait_ms must be non-negative; got {lock_wait_values}"
     )
+
+
+def test_winner_query_ms_emitted_for_normal_winner(monkeypatch):
+    """
+    inflight_guard.winner_query_ms must be emitted by the first (winning)
+    thread with a non-negative value so operators can compare it against
+    wait_ms.
+
+    Diagnostic use-case
+    -------------------
+    If dedupe hit rate is high but latency is not improving:
+    * wait_ms ≈ winner_query_ms → guard is correct; the query itself is slow.
+      Optimise the SQL or add a DB-side query timeout.
+    * wait_ms ≫ winner_query_ms → waiters blocked longer than the query took;
+      check lock_wait_ms or OS scheduling pressure.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    with inflight_guard("obs-winner-query-ms-key"):
+        time.sleep(0.01)  # simulate a minimal query duration
+
+    timing_keys = [k for k, _ in fake_stats.timing_calls]
+    assert "inflight_guard.winner_query_ms" in timing_keys, (
+        "inflight_guard.winner_query_ms was not emitted by the winning thread"
+    )
+    winner_ms_values = [
+        v for k, v in fake_stats.timing_calls if k == "inflight_guard.winner_query_ms"
+    ]
+    assert all(v >= 0 for v in winner_ms_values), (
+        f"inflight_guard.winner_query_ms must be non-negative; got {winner_ms_values}"
+    )
+
+
+def test_winner_query_ms_emitted_for_takeover_thread(monkeypatch):
+    """
+    inflight_guard.winner_query_ms must also be emitted by the takeover thread
+    so that both normal-winner and takeover executions are observable.
+
+    Diagnostic use-case
+    -------------------
+    Each takeover = one extra query execution.  Its duration is emitted as
+    winner_query_ms alongside the normal winner's duration, allowing operators
+    to see how long the replacement query took vs the original wait time.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-takeover-winner-query-ms-key"
+    original_timeout = query_cache_module._INFLIGHT_WAIT_TIMEOUT_S
+    query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = 0.05
+
+    thread1_inside = threading.Event()
+    thread1_allowed_to_exit = threading.Event()
+
+    def slow_thread() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread1_allowed_to_exit.wait(timeout=10)
+
+    def waiter_thread() -> None:
+        thread1_inside.wait(timeout=5)
+        with inflight_guard(key):
+            pass  # takeover winner does minimal work
+
+    try:
+        t1 = threading.Thread(target=slow_thread)
+        tw = threading.Thread(target=waiter_thread)
+        t1.start()
+        thread1_inside.wait(timeout=5)
+        tw.start()
+        tw.join(timeout=5)
+        thread1_allowed_to_exit.set()
+        t1.join(timeout=5)
+    finally:
+        query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout
+
+    timing_keys = [k for k, _ in fake_stats.timing_calls]
+    assert "inflight_guard.winner_query_ms" in timing_keys, (
+        "inflight_guard.winner_query_ms was not emitted for the takeover thread"
+    )
+
+
+def test_winner_query_ms_not_emitted_by_non_executing_waiter(monkeypatch):
+    """
+    A waiter that is released normally (no timeout, no takeover) must NOT
+    emit winner_query_ms — it did not execute a query.
+
+    This ensures operators can use winner_query_ms as a clean signal of actual
+    query executions without noise from threads that only read from cache.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-waiter-no-winner-ms-key"
+    thread1_inside = threading.Event()
+    thread2_done = threading.Event()
+    waiter_timing_calls: list[tuple[str, float]] = []
+
+    def thread1_fn() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread2_done.wait(timeout=5)
+
+    def thread2_fn() -> None:
+        # Capture timing calls emitted ONLY while thread2 is running.
+        thread1_inside.wait(timeout=5)
+        before = len(fake_stats.timing_calls)
+        with inflight_guard(key):
+            pass  # is_first=False; should NOT emit winner_query_ms
+        waiter_timing_calls.extend(fake_stats.timing_calls[before:])
+        thread2_done.set()
+
+    t1 = threading.Thread(target=thread1_fn)
+    t2 = threading.Thread(target=thread2_fn)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    waiter_emitted_keys = [k for k, _ in waiter_timing_calls]
+    assert "inflight_guard.winner_query_ms" not in waiter_emitted_keys, (
+        "A non-executing waiter thread emitted winner_query_ms, which would "
+        f"skew execution-duration metrics.  Calls from waiter: {waiter_timing_calls}"
+    )

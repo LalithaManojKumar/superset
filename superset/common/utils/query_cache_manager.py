@@ -190,6 +190,62 @@ def _emit_stat(stat_key: str, value: float | None = None) -> None:
         same lock — which is a signal that the per-process inflight table is
         becoming a serialisation bottleneck and should be investigated (e.g.
         by sharding keys or reducing dashboard request fan-out).
+    ``inflight_guard.winner_query_ms``
+        Timing (ms) of how long the winning (or takeover) thread spent inside
+        the guard — i.e. the actual query execution time from the guard's
+        perspective.  Compare with ``inflight_guard.wait_ms``:
+
+        * ``wait_ms ≈ winner_query_ms`` → guard is working correctly; waiters
+          blocked for roughly the same duration as the query took.  If overall
+          latency is still not improving, the query itself is the bottleneck —
+          optimise the SQL or add a DB-side timeout.
+        * ``wait_ms ≪ winner_query_ms`` → waiters were released early (winner
+          finished quickly after the event fired); examine whether the cache
+          is warm and returning stale data.
+        * ``wait_ms ≫ winner_query_ms`` → waiters are somehow blocked longer
+          than the winner ran; check for lock contention (``lock_wait_ms``) or
+          OS-level scheduling pressure.
+
+    ``inflight_guard.cache_hit_after_wait``
+        Counter incremented (by the call site, not the guard itself) when a
+        waiter thread re-reads the cache after unblocking and finds data.
+        A high ratio of ``cache_hit_after_wait / deduped`` confirms that
+        deduplication is genuinely saving work: waiters received the winner's
+        result without executing their own query.
+    ``inflight_guard.cache_miss_after_wait``
+        Counter incremented (by the call site) when a waiter re-reads the
+        cache after unblocking but finds nothing.  This means the winner
+        failed or wrote an error sentinel, and the waiter still needs to
+        execute the query itself.  High values mean the guard is adding wait
+        time *without* saving DB work — investigate why the winner is failing
+        (check ``inflight_guard.timeout``, ``inflight_guard.takeover``, and
+        application error logs).
+
+    Diagnostic workflow — "high dedupe hit rate but latency not improving"
+    -----------------------------------------------------------------------
+    If ``inflight_guard.deduped`` is high but end-to-end latency has not
+    improved, use the following decision tree:
+
+    1. ``wait_ms ≈ winner_query_ms`` and ``cache_hit_after_wait`` high
+       → Guard is working correctly but the query itself is slow.
+         Optimise the SQL, add an index, or set a DB query timeout.
+
+    2. ``wait_ms ≈ timeout`` and ``timeout`` counter high
+       → Winner regularly exceeds ``QUERY_INFLIGHT_TIMEOUT_S``.
+         Lower the timeout or fix the slow query.  Every timeout produces
+         at least one takeover (extra query execution).
+
+    3. ``cache_miss_after_wait`` high
+       → Winner is failing before writing cache; waiters unblock, re-read
+         cache, find nothing, and execute the query themselves.  The guard
+         added wait time *and* didn't save any work.  Check error logs and
+         ``inflight_guard.takeover``.
+
+    4. ``lock_wait_ms`` high
+       → Lock contention is a bottleneck.  Many threads are competing for
+         ``_inflight_lock`` simultaneously.  Reduce dashboard fan-out (fewer
+         charts sharing the same key) or investigate why requests are arriving
+         in tight bursts.
     """
     try:
         stats_logger = current_app.config["STATS_LOGGER"]
@@ -377,8 +433,16 @@ def inflight_guard(
                     cache_key,
                 )
                 try:
+                    # --- Observability: takeover query duration ----------------
+                    # Time how long this takeover thread spends executing so
+                    # operators can compare winner_query_ms with wait_ms.
+                    _takeover_start = time.monotonic()
                     yield True
                 finally:
+                    _emit_stat(
+                        "inflight_guard.winner_query_ms",
+                        (time.monotonic() - _takeover_start) * 1000,
+                    )
                     with _inflight_lock:
                         if _inflight_events.get(cache_key) is takeover_event:
                             _inflight_events.pop(cache_key, None)
@@ -394,8 +458,19 @@ def inflight_guard(
 
     # We are the first thread for this cache key.
     try:
+        # --- Observability: winner query duration ------------------------------
+        # Time how long the first (winning) thread spends inside the guard.
+        # Compare with inflight_guard.wait_ms to answer: "are waiters blocking
+        # for as long as the query actually takes?"  If wait_ms ≈ winner_query_ms
+        # the guard is behaving correctly; if latency is still high, the query
+        # itself is the bottleneck.
+        _winner_start = time.monotonic()
         yield True
     finally:
+        _emit_stat(
+            "inflight_guard.winner_query_ms",
+            (time.monotonic() - _winner_start) * 1000,
+        )
         # Only remove OUR event – a concurrent takeover may have already
         # replaced it with a new one that other threads are waiting on.
         with _inflight_lock:
