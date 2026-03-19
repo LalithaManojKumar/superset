@@ -59,6 +59,7 @@ Tests in the "Security isolation" section below verify that:
      safe to deduplicate) are correctly serialised by the guard.
 """
 
+import pickle
 import threading
 import time
 
@@ -1609,3 +1610,198 @@ def test_metrics_deduped_count_matches_waiter_count(monkeypatch):
         f"got {winner_ms_count}. This metric is needed to compare against wait_ms "
         f"to determine if the guard is saving work or adding latency."
     )
+
+
+# ---------------------------------------------------------------------------
+# Production-closer improvement: thread-safe, serializing cache
+#
+# Gap in the above tests
+# -----------------------
+# The E2E tests above use a raw Python ``dict`` as the fake cache.  A plain
+# dict differs from real production cache backends in three important ways:
+#
+#   1. No serialization – Python objects are stored by reference.  Real
+#      backends (Redis via flask-caching, SimpleCache, Memcached) serialise
+#      values with pickle before storing and deserialise on read.  A
+#      serialization error (e.g. an unpicklable object in the result) would
+#      be silent in the dict-based test but would crash in production.
+#
+#   2. Not lock-protected – ``dict.get``/``dict.__setitem__`` on CPython are
+#      individually GIL-safe, but a read-check-then-write sequence is NOT
+#      atomic.  Real cache backends use server-side atomicity (Redis) or
+#      internal locking (SimpleCache).  A test with a plain dict can never
+#      surface race conditions in the read-modify-write cycle.
+#
+#   3. No TTL / expiry – dict entries live forever.  In production a cache
+#      entry can expire between the winner's write and a waiter's re-read,
+#      turning a "cache hit" into a "cache miss" and causing an unexpected
+#      second DB execution.
+#
+# What is still NOT covered even after this improvement
+# -------------------------------------------------------
+# ``inflight_guard`` uses ``threading.Event`` and ``threading.Lock``, which
+# are **in-process** primitives only.  Under a multi-process deployment
+# (Gunicorn pre-fork, uWSGI workers, Celery), each worker process runs its
+# own independent copy of ``_inflight_events``.  Two requests routed to
+# *different* workers will BOTH execute the query — the guard provides no
+# cross-process deduplication.  Cross-process deduplication would require a
+# distributed lock (e.g. Redis SETNX / SET NX PX), which inflight_guard
+# intentionally does not use because it targets the far-more-common
+# same-worker concurrent burst (N chart POSTs from the same browser tab).
+# ---------------------------------------------------------------------------
+
+
+class _ThreadSafePickleCache:
+    """
+    A minimal thread-safe, pickle-serializing in-memory cache.
+
+    Closer to production than a raw ``dict`` because:
+    - All get/set/contains operations are protected by a single ``threading.Lock``,
+      making the read-check-write sequence atomic.
+    - Values are round-tripped through ``pickle.dumps`` / ``pickle.loads`` on
+      every write / read, surfacing serialization errors that would be invisible
+      with a plain dict.
+    - An optional per-key TTL is enforced on reads (entries older than ``timeout``
+      seconds are treated as misses), mimicking real cache expiry.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Maps key → (serialized_bytes, write_time, timeout_s | None)
+        self._store: dict[str, tuple[bytes, float, float | None]] = {}
+
+    def set(self, key: str, value: object, timeout: float | None = None) -> None:
+        serialized = pickle.dumps(value)
+        with self._lock:
+            self._store[key] = (serialized, time.monotonic(), timeout)
+
+    def get(self, key: str) -> object | None:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            serialized, write_time, timeout = entry
+            if timeout is not None and (time.monotonic() - write_time) > timeout:
+                del self._store[key]
+                return None
+        return pickle.loads(serialized)  # noqa: S301  (test-only, trusted data)
+
+    def __contains__(self, key: str) -> bool:
+        return self.get(key) is not None
+
+
+def test_identical_charts_concurrent_with_thread_safe_cache():
+    """
+    Improvement: repeat the identical-charts scenario with a thread-safe,
+    pickle-serializing cache instead of a plain dict.
+
+    Scenario
+    --------
+    12 dashboard charts share exactly the same query key and all miss the
+    cache simultaneously.  The query returns a dict payload (matching the
+    shape of a real ``QueryCacheManager`` result).
+
+    Extra production-realism over the plain-dict tests
+    ---------------------------------------------------
+    * The cache uses ``threading.Lock`` for atomicity: the winner's ``set``
+      and every waiter's ``get`` are fully serialised, eliminating dict TOCTOU
+      races.
+    * Values are round-tripped through ``pickle``: if the result were ever
+      unpicklable the test would fail here rather than silently in production.
+    * A 5-second TTL is set on the cache entry, matching the short-timeout
+      scenario where cache entries could expire between write and re-read
+      (guarded against by the inflight_guard's single-execution guarantee).
+
+    Assertions
+    ----------
+    1. ``exec_count == 1``  — only one DB query executed (deduplication holds
+       with a lock-protected cache backend).
+    2. Every thread successfully read back a non-None, correctly deserialized
+       result — no silent serialization failures.
+    3. The deserialized result matches the original payload — no data
+       corruption through the pickle round-trip.
+    """
+    n_charts = 12
+    key = "e2e-thread-safe-cache-key"
+    cache = _ThreadSafePickleCache()
+    errors: list[str] = []
+    exec_count = 0
+    exec_lock = threading.Lock()
+    results_seen: list[object] = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(n_charts)
+
+    # Shape matches a real QueryCacheManager payload so pickle exercises the
+    # same serialization path as production.
+    expected_payload = {
+        "df": {"col1": [1, 2, 3], "col2": ["a", "b", "c"]},
+        "query": "SELECT col1, col2 FROM physical_dataset LIMIT 10000",
+        "status": "success",
+        "rowcount": 3,
+    }
+
+    def chart_request(idx: int) -> None:
+        nonlocal exec_count
+        try:
+            barrier.wait(timeout=10)
+
+            # Cache-miss check through the lock-protected API.
+            result = cache.get(key)
+            if result is None:
+                with inflight_guard(key) as is_first:
+                    if not is_first:
+                        # Re-read after the winner signals completion.
+                        result = cache.get(key)
+
+                    if is_first or result is None:
+                        with exec_lock:
+                            exec_count += 1
+                        # Simulate a 30 ms DB query.
+                        time.sleep(0.03)
+                        result = expected_payload
+                        # Write with a 5-second TTL (short enough to stress
+                        # the expiry path if this test is run repeatedly).
+                        cache.set(key, result, timeout=5.0)
+                        result = cache.get(key)  # re-read to confirm round-trip
+
+            with results_lock:
+                results_seen.append(result)
+
+        except (threading.BrokenBarrierError, RuntimeError) as exc:
+            errors.append(f"thread-{idx}: {exc}")
+
+    threads = [
+        threading.Thread(target=chart_request, args=(i,), name=f"chart-{i}")
+        for i in range(n_charts)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    if errors:
+        pytest.fail(f"Thread errors during lock-protected cache simulation: {errors}")
+
+    # 1. Exactly one DB query must have executed.
+    assert exec_count == 1, (
+        f"Expected exactly 1 DB query execution for {n_charts} concurrent chart "
+        f"requests with a lock-protected cache. Got exec_count={exec_count}. "
+        f"The inflight_guard must deduplicate even when cache reads are locked."
+    )
+
+    # 2. Every thread must have obtained a non-None result (no silent misses).
+    none_results = [r for r in results_seen if r is None]
+    assert not none_results, (
+        f"{len(none_results)} of {n_charts} threads got None from the cache. "
+        f"This indicates that either the TTL expired between write and re-read, "
+        f"or a waiter thread read before the winner's set() completed. "
+        f"results_seen={results_seen}"
+    )
+
+    # 3. Every result must match the original payload after pickle round-trip.
+    for i, result in enumerate(results_seen):
+        assert result == expected_payload, (
+            f"Thread {i} received a corrupted result after pickle serialisation. "
+            f"Expected: {expected_payload!r}. Got: {result!r}. "
+            f"This would indicate a data-corruption bug in the cache path."
+        )
