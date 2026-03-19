@@ -64,6 +64,7 @@ import time
 
 import pytest
 
+import superset.common.utils.query_cache_manager as query_cache_module
 from superset.common.utils.query_cache_manager import (
     _inflight_events,
     _inflight_lock,
@@ -473,3 +474,226 @@ def test_different_key_threads_never_unblock_each_other():
     assert key_b_is_first_received == [True, False], (
         f"Expected [True, False] for key-B, got {key_b_is_first_received}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Timeout / takeover tests
+#
+# These tests verify the "takeover" mechanism that prevents the thundering
+# herd when the guard wait timeout fires:
+#
+#   * When the original executor (Thread-1) takes longer than the configured
+#     timeout, ALL waiting threads' event.wait() calls return at the same
+#     moment.  WITHOUT the takeover mechanism they would ALL retry the query
+#     simultaneously, recreating the thundering herd.
+#
+#   * WITH the takeover mechanism, exactly ONE of the timeout-waiters atomically
+#     replaces the in-flight event and becomes the new executor (is_first=True).
+#     All other timeout-waiters see the replacement and wait for that single new
+#     executor before yielding is_first=False.
+#
+# The tests monkey-patch the module-level _INFLIGHT_WAIT_TIMEOUT_S so they
+# can trigger a short, controllable timeout without actually waiting 60 s.
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_triggers_single_takeover_not_thundering_herd():
+    """
+    Core takeover test.
+
+    When the guard wait times out, exactly ONE waiter should take over as the
+    new executor (is_first=True).  All other waiters must block until the
+    takeover finishes, then receive is_first=False.
+
+    Real-world mapping:
+    ──────────────────
+    Thread-1 is running a slow query (>_INFLIGHT_WAIT_TIMEOUT_S seconds).
+    Threads 2-N all enter inflight_guard for the same key and block.
+    After the timeout fires, only Thread-2 (the takeover winner) should
+    execute.  Threads 3-N must wait for Thread-2, not execute themselves.
+    """
+    key = "slow-query-key"
+    concurrency = 5  # Threads 2-5 are waiters; Thread-1 is the slow original
+
+    # Patch the module timeout to 0.05 s so the test runs fast.
+    original_timeout = query_cache_module._INFLIGHT_WAIT_TIMEOUT_S
+    query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = 0.05
+    try:
+        takeover_count = 0  # threads that received is_first=True via takeover
+        waiter_count = 0  # threads that received is_first=False after takeover
+        counts_lock = threading.Lock()
+
+        # Thread-1 holds the slot for longer than the timeout.
+        thread1_inside = threading.Event()
+        thread1_allowed_to_exit = threading.Event()
+
+        def slow_first_thread() -> None:
+            with inflight_guard(key) as is_first:
+                assert is_first is True
+                thread1_inside.set()
+                # Stay inside past the waiters' timeout
+                thread1_allowed_to_exit.wait(timeout=5)
+
+        def waiter_thread() -> None:
+            nonlocal takeover_count, waiter_count
+            thread1_inside.wait(timeout=5)
+            with inflight_guard(key) as is_first:
+                with counts_lock:
+                    if is_first:
+                        takeover_count += 1
+                    else:
+                        waiter_count += 1
+
+        t1 = threading.Thread(target=slow_first_thread)
+        waiters = [
+            threading.Thread(target=waiter_thread) for _ in range(concurrency - 1)
+        ]
+
+        t1.start()
+        thread1_inside.wait(timeout=5)
+        for t in waiters:
+            t.start()
+
+        # Wait for all waiter threads to finish (the timeout + takeover completes).
+        for t in waiters:
+            t.join(timeout=10)
+
+        # Now let Thread-1 finish (it should NOT disrupt the waiter results).
+        thread1_allowed_to_exit.set()
+        t1.join(timeout=5)
+
+        assert takeover_count == 1, (
+            f"Exactly ONE timeout-waiter should become the takeover executor, "
+            f"but {takeover_count} did (thundering herd on timeout not fixed)"
+        )
+        assert waiter_count == concurrency - 2, (
+            f"All other waiters should receive is_first=False (re-read from cache), "
+            f"but {waiter_count} did (expected {concurrency - 2})"
+        )
+    finally:
+        query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout
+
+
+def test_original_executor_cleanup_does_not_discard_takeover_event():
+    """
+    Thread-1's cleanup must NOT remove the takeover thread's event.
+
+    When Thread-1 finishes *after* a takeover has already replaced its event
+    in _inflight_events, Thread-1's finally block should leave the takeover
+    event intact so that other threads waiting on it are not orphaned.
+    """
+    key = "takeover-cleanup-key"
+
+    # Patch timeout to 0.05 s.
+    original_timeout = query_cache_module._INFLIGHT_WAIT_TIMEOUT_S
+    query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = 0.05
+    try:
+        thread1_inside = threading.Event()
+        thread1_allowed_to_exit = threading.Event()
+        takeover_inside = threading.Event()
+        takeover_allowed_to_exit = threading.Event()
+
+        def slow_thread1() -> None:
+            with inflight_guard(key):
+                thread1_inside.set()
+                thread1_allowed_to_exit.wait(timeout=10)
+
+        def takeover_thread() -> None:
+            thread1_inside.wait(timeout=5)
+            with inflight_guard(key) as is_first:
+                # We should be the takeover (is_first=True after timeout)
+                if is_first:
+                    takeover_inside.set()
+                    takeover_allowed_to_exit.wait(timeout=10)
+
+        t1 = threading.Thread(target=slow_thread1)
+        t_takeover = threading.Thread(target=takeover_thread)
+
+        t1.start()
+        thread1_inside.wait(timeout=5)
+        t_takeover.start()
+
+        # Wait for timeout to fire and takeover to begin
+        takeover_inside.wait(timeout=3)
+
+        # Now let Thread-1 finish while the takeover is still running.
+        # Thread-1's cleanup should NOT remove the takeover's event.
+        thread1_allowed_to_exit.set()
+        t1.join(timeout=5)
+
+        # The takeover event should still be in the dict (Thread-1 must not
+        # have removed it).
+        with _inflight_lock:
+            event_present = key in _inflight_events
+        assert event_present, (
+            "Thread-1's cleanup removed the takeover thread's event from "
+            "_inflight_events, which would orphan any threads waiting on it"
+        )
+
+        # Let the takeover finish normally.
+        takeover_allowed_to_exit.set()
+        t_takeover.join(timeout=5)
+
+        # After takeover completes, the dict entry should be gone.
+        with _inflight_lock:
+            assert key not in _inflight_events, (
+                "Takeover thread should have removed its event on exit"
+            )
+    finally:
+        query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout
+
+
+def test_configurable_timeout_via_module_attribute():
+    """
+    Verify that _INFLIGHT_WAIT_TIMEOUT_S controls how long waiters block.
+
+    In tests without a Flask app context, _get_inflight_timeout() falls back
+    to the module-level _INFLIGHT_WAIT_TIMEOUT_S constant.  Monkey-patching
+    that constant must change the actual wait duration seen by waiters.
+    """
+    key = "timeout-config-key"
+    short_timeout = 0.05  # 50 ms
+
+    original_timeout = query_cache_module._INFLIGHT_WAIT_TIMEOUT_S
+    query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = short_timeout
+    thread1_inside = threading.Event()
+    thread1_allowed_to_exit = threading.Event()
+    waiter_wait_duration: list[float] = []
+    t1 = None
+    tw = None
+    try:
+
+        def long_running_thread() -> None:
+            with inflight_guard(key):
+                thread1_inside.set()
+                thread1_allowed_to_exit.wait(timeout=10)
+
+        def timing_waiter() -> None:
+            thread1_inside.wait(timeout=5)
+            start = time.monotonic()
+            with inflight_guard(key):
+                pass
+            waiter_wait_duration.append(time.monotonic() - start)
+
+        t1 = threading.Thread(target=long_running_thread)
+        tw = threading.Thread(target=timing_waiter)
+        t1.start()
+        thread1_inside.wait(timeout=5)
+        tw.start()
+        tw.join(timeout=5)
+
+        assert waiter_wait_duration, "Waiter thread did not complete"
+        # The waiter should have been unblocked close to the short timeout,
+        # not after the default 60 s.
+        assert waiter_wait_duration[0] < 5, (
+            f"Waiter blocked for {waiter_wait_duration[0]:.2f}s, "
+            f"expected ~{short_timeout}s — configurable timeout not respected"
+        )
+    finally:
+        # Ensure Thread-1 is always released so it does not block teardown.
+        thread1_allowed_to_exit.set()
+        if t1 is not None:
+            t1.join(timeout=5)
+        if tw is not None:
+            tw.join(timeout=5)
+        query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout

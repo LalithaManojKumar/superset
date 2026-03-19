@@ -90,6 +90,30 @@ _cache: dict[CacheRegion, Cache] = {
 #     identical result, which is harmless.
 #   * force_query=True bypasses the guard intentionally: the user has
 #     explicitly requested fresh data, so we should not coalesce that request.
+#
+# Timeout and "takeover" – the biggest production risk:
+# ---------------------------------------------------------------------------
+#   The frontend aborts HTTP requests instantly (via AbortController) when a
+#   user changes a dashboard filter.  The corresponding backend threads,
+#   however, continue waiting inside inflight_guard until the guard timeout
+#   expires.  If that timeout is much larger than the actual query runtime,
+#   threads pile up holding DB connections and thread-pool slots for requests
+#   that nobody will ever read.
+#
+#   When the timeout DOES fire, the original code woke ALL N−1 waiting threads
+#   simultaneously, causing each of them to retry the query — recreating the
+#   thundering herd.
+#
+#   The "takeover" mechanism (see inflight_guard below) fixes this: the FIRST
+#   timeout-waiter to wake up atomically replaces the in-flight event and
+#   becomes the new sole executor.  All other timeout-waiters see the new event
+#   and wait for the takeover thread to finish instead of executing themselves.
+#   This keeps the maximum concurrent executions at 2 (original + takeover)
+#   regardless of how many threads are waiting.
+#
+#   The timeout value defaults to SUPERSET_WEBSERVER_TIMEOUT at runtime so
+#   that backend threads do not outlive the HTTP connections they serve.
+#   Operators can override it via the QUERY_INFLIGHT_TIMEOUT_S config key.
 # ---------------------------------------------------------------------------
 # All reads and writes to _inflight_events MUST be done while holding
 # _inflight_lock to avoid TOCTOU races.  The lock is intentionally
@@ -98,12 +122,31 @@ _cache: dict[CacheRegion, Cache] = {
 _inflight_events: dict[str, threading.Event] = {}
 _inflight_lock = threading.Lock()
 
-#: How long (seconds) a waiter will block before giving up and executing the
-#: query itself.  Acts as a safety valve so a slow/hung query never locks
-#: other threads indefinitely.  Should be set conservatively higher than the
-#: expected worst-case query duration.  Not currently user-configurable, but
-#: can be overridden in tests by monkey-patching this module attribute.
+#: Fallback timeout (seconds) used when no Flask application context is
+#: available (e.g. unit tests that call inflight_guard directly).  In
+#: production the runtime value is read from QUERY_INFLIGHT_TIMEOUT_S or
+#: SUPERSET_WEBSERVER_TIMEOUT via _get_inflight_timeout().
 _INFLIGHT_WAIT_TIMEOUT_S = 60
+
+
+def _get_inflight_timeout() -> int:
+    """Return the configured inflight-guard wait timeout in seconds.
+
+    Reads ``QUERY_INFLIGHT_TIMEOUT_S`` from the Flask application config when
+    a request context is active.  Falls back to ``SUPERSET_WEBSERVER_TIMEOUT``
+    when ``QUERY_INFLIGHT_TIMEOUT_S`` is ``None`` (the default), and falls
+    back to the module-level ``_INFLIGHT_WAIT_TIMEOUT_S`` constant when there
+    is no Flask application context (e.g. unit tests).
+    """
+    try:
+        cfg = current_app.config
+        explicit = cfg.get("QUERY_INFLIGHT_TIMEOUT_S")
+        if explicit is not None:
+            return int(explicit)
+        return int(cfg.get("SUPERSET_WEBSERVER_TIMEOUT", _INFLIGHT_WAIT_TIMEOUT_S))
+    except RuntimeError:
+        # No active Flask application context (unit tests).
+        return _INFLIGHT_WAIT_TIMEOUT_S
 
 
 @contextmanager
@@ -150,6 +193,29 @@ def inflight_guard(
     restricted user to receive data that was fetched in the context of a less-
     restricted user.
 
+    Timeout and takeover
+    --------------------
+    The wait timeout is read from the ``QUERY_INFLIGHT_TIMEOUT_S`` Flask
+    config key, falling back to ``SUPERSET_WEBSERVER_TIMEOUT``.  This keeps
+    the backend wait aligned with the HTTP deadline so threads do not outlive
+    the connections they serve.
+
+    When a waiter's timeout fires:
+
+    * The **first** waiter to notice atomically replaces the original event in
+      ``_inflight_events`` with a new one and becomes the "takeover" executor,
+      yielding ``True`` so the caller runs the query.
+    * All **other** waiters see the replacement event and wait for the takeover
+      executor to complete, then yield ``False`` so the caller re-reads cache.
+
+    This keeps concurrent executions at most 2 (original + one takeover)
+    regardless of the number of waiting threads, preventing the thundering herd
+    that would otherwise occur when all N−1 waiters time out simultaneously.
+
+    The original executor (Thread-1) only removes its **own** event from
+    ``_inflight_events`` on cleanup, so it cannot accidentally discard the
+    takeover thread's replacement event.
+
     Usage::
 
         with inflight_guard(cache_key) as is_first:
@@ -162,6 +228,8 @@ def inflight_guard(
     if not cache_key:
         yield True
         return
+
+    timeout = _get_inflight_timeout()
 
     with _inflight_lock:
         if cache_key in _inflight_events:
@@ -176,7 +244,50 @@ def inflight_guard(
         logger.debug(
             "Single-flight: waiting for in-flight query with cache key: %s", cache_key
         )
-        event.wait(timeout=_INFLIGHT_WAIT_TIMEOUT_S)
+        was_set = event.wait(timeout=timeout)
+
+        if not was_set:
+            # The wait timed out: the original executor is still running.
+            # Race all timeout-waiters: the FIRST to win the lock atomically
+            # replaces the original event and becomes the new executor.
+            # All losers discover the replacement and wait for the winner.
+            logger.warning(
+                "Single-flight: guard timed out after %ss for cache key '%s'. "
+                "Original query is still running. "
+                "One waiter will take over; others will wait for the takeover.",
+                timeout,
+                cache_key,
+            )
+            with _inflight_lock:
+                if _inflight_events.get(cache_key) is event:
+                    # We are the takeover winner: install a fresh event.
+                    takeover_event = threading.Event()
+                    _inflight_events[cache_key] = takeover_event
+                    is_takeover = True
+                else:
+                    # Another thread already took over; wait for it.
+                    is_takeover = False
+                    current_event = _inflight_events.get(cache_key)
+
+            if is_takeover:
+                logger.warning(
+                    "Single-flight: this thread is taking over execution "
+                    "for cache key '%s'.",
+                    cache_key,
+                )
+                try:
+                    yield True
+                finally:
+                    with _inflight_lock:
+                        if _inflight_events.get(cache_key) is takeover_event:
+                            _inflight_events.pop(cache_key, None)
+                    takeover_event.set()
+                return
+
+            # Not the takeover winner: wait for the takeover thread.
+            if current_event is not None:
+                current_event.wait(timeout=timeout)
+
         yield False
         return
 
@@ -184,9 +295,11 @@ def inflight_guard(
     try:
         yield True
     finally:
-        # Unblock all waiters and remove our entry regardless of outcome.
+        # Only remove OUR event – a concurrent takeover may have already
+        # replaced it with a new one that other threads are waiting on.
         with _inflight_lock:
-            _inflight_events.pop(cache_key, None)
+            if _inflight_events.get(cache_key) is event:
+                _inflight_events.pop(cache_key, None)
         event.set()
 
 
