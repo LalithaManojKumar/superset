@@ -49,6 +49,7 @@ from superset.utils.core import (
     GenericDataType,
     get_column_names_from_columns,
     get_column_names_from_metrics,
+    get_stacktrace,
     is_adhoc_column,
     is_adhoc_metric,
 )
@@ -161,6 +162,35 @@ class QueryContextProcessor:
                     except QueryObjectValidationError as ex:
                         cache.error_message = str(ex)
                         cache.status = QueryStatus.FAILED
+                        # Notify waiting threads of this deterministic failure
+                        # via a short-lived sentinel so they return the error
+                        # without re-executing the same query.
+                        if cache_key and not force_query:
+                            QueryCacheManager.set_error_sentinel(
+                                key=cache_key,
+                                error_message=cache.error_message,
+                                region=CacheRegion.DATA,
+                            )
+                    except Exception as ex:  # pylint: disable=broad-except
+                        # Catch-all for unexpected errors (DB connection lost,
+                        # driver exceptions, etc.) so the inflight_guard event
+                        # is always fired cleanly by its own finally block and
+                        # waiting threads are never left orphaned.
+                        cache.error_message = error_msg_from_exception(ex)
+                        cache.status = QueryStatus.FAILED
+                        cache.stacktrace = get_stacktrace()
+                        logger.exception(
+                            "Unexpected error executing query for cache key %s",
+                            cache_key,
+                        )
+                        # Write a sentinel so waiters see this failure and skip
+                        # re-execution rather than all hitting the same DB error.
+                        if cache_key and not force_query:
+                            QueryCacheManager.set_error_sentinel(
+                                key=cache_key,
+                                error_message=cache.error_message,
+                                region=CacheRegion.DATA,
+                            )
 
         # the N-dimensional DataFrame has converted into flat DataFrame
         # by `flatten operator`, "comma" in the column is escaped by `escape_separator`

@@ -128,6 +128,14 @@ _inflight_lock = threading.Lock()
 #: SUPERSET_WEBSERVER_TIMEOUT via _get_inflight_timeout().
 _INFLIGHT_WAIT_TIMEOUT_S = 60
 
+#: TTL (seconds) for the short-lived error sentinels written to the shared
+#: cache backend when the "winner" thread of an inflight_guard fails.
+#: Waiting threads read this sentinel and return the cached failure
+#: immediately instead of all re-executing the same failing query.  The TTL
+#: is kept short so that transient failures (e.g. brief DB unavailability)
+#: do not suppress later successful queries for longer than necessary.
+_ERROR_SENTINEL_TTL_S = 30
+
 
 def _get_inflight_timeout() -> int:
     """Return the configured inflight-guard wait timeout in seconds.
@@ -426,6 +434,21 @@ class QueryCacheManager:
             return query_cache
 
         if cache_value := _cache[region].get(key):
+            # Detect an error sentinel written by a failed winner thread.
+            # Setting is_loaded=True signals callers to skip re-execution;
+            # status=FAILED and error_message tell them to surface the error.
+            if "__error__" in cache_value:
+                query_cache.error_message = cache_value["__error__"]
+                query_cache.status = QueryStatus.FAILED
+                query_cache.is_loaded = True
+                query_cache.is_cached = True
+                logger.debug(
+                    "Inflight guard: error sentinel hit for key %s – "
+                    "returning cached failure without re-executing",
+                    key,
+                )
+                return query_cache
+
             logger.debug("Cache key: %s", key)
             # Log cache hit for debugging
             logger.debug("CACHE GET - Key: %s, Region: %s", key, region)
@@ -470,6 +493,34 @@ class QueryCacheManager:
             )
             raise CacheLoadError("Error loading data from cache")
         return query_cache
+
+    @classmethod
+    def set_error_sentinel(
+        cls,
+        key: str,
+        error_message: str,
+        region: CacheRegion = CacheRegion.DATA,
+    ) -> None:
+        """Write a short-lived error marker to the shared cache backend.
+
+        Called by the winner thread of ``inflight_guard`` when a query fails,
+        so that threads blocked on the same cache key can read the failure
+        result immediately instead of all re-executing the same failing query.
+
+        Sentinels are stored as ``{"__error__": <message>}`` and expire after
+        ``_ERROR_SENTINEL_TTL_S`` seconds.  The short TTL ensures that
+        transient failures (e.g. brief DB unavailability) do not suppress
+        later successful queries for longer than necessary.
+
+        Recognised by ``QueryCacheManager.get()`` via the ``"__error__"`` key.
+        """
+        if key and _cache.get(region):
+            cls.set(
+                key=key,
+                value={"__error__": error_message},
+                timeout=_ERROR_SENTINEL_TTL_S,
+                region=region,
+            )
 
     @staticmethod
     def set(
