@@ -697,3 +697,280 @@ def test_configurable_timeout_via_module_attribute():
         if tw is not None:
             tw.join(timeout=5)
         query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout
+
+
+# ---------------------------------------------------------------------------
+# Observability / metrics tests
+#
+# These tests verify that inflight_guard emits the correct stats-logger
+# counters and timings so operators can debug whether deduplication is
+# actually reducing work (low wait_ms) vs just adding latency (high wait_ms).
+#
+# Metric reference (see _emit_stat docstring for full details):
+#   inflight_guard.deduped   – counter; each coalesced waiter thread
+#   inflight_guard.wait_ms   – timing; how long each waiter actually blocked
+#   inflight_guard.timeout   – counter; guard wait timed out before winner finished
+#   inflight_guard.takeover  – counter; a timeout-waiter became the new executor
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_stats_logger():
+    """Return a minimal stats-logger stub that records calls."""
+
+    class _FakeStats:
+        def __init__(self) -> None:
+            self.incr_calls: list[str] = []
+            self.timing_calls: list[tuple[str, float]] = []
+
+        def incr(self, key: str) -> None:
+            self.incr_calls.append(key)
+
+        def timing(self, key: str, value: float) -> None:
+            self.timing_calls.append((key, value))
+
+        def gauge(self, key: str, value: float) -> None:  # noqa: ARG002
+            pass
+
+    return _FakeStats()
+
+
+def test_deduped_counter_emitted_for_waiter(monkeypatch):
+    """
+    inflight_guard.deduped must be incremented exactly once for every waiter
+    thread that coalesces instead of executing its own query.
+
+    Debugging use-case
+    ------------------
+    Comparing inflight_guard.deduped against the raw request count tells
+    operators the dedupe hit rate.  A high rate is *expected* on a busy
+    dashboard.  The deduped counter alone does not distinguish "saving work"
+    from "adding wait time" — combine it with wait_ms for that.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-deduped-key"
+    thread1_inside = threading.Event()
+    thread2_done = threading.Event()
+
+    def thread1_fn() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread2_done.wait(timeout=5)
+
+    def thread2_fn() -> None:
+        thread1_inside.wait(timeout=5)
+        with inflight_guard(key):
+            pass
+        thread2_done.set()
+
+    t1 = threading.Thread(target=thread1_fn)
+    t2 = threading.Thread(target=thread2_fn)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert "inflight_guard.deduped" in fake_stats.incr_calls, (
+        "inflight_guard.deduped counter was not emitted for the coalesced waiter"
+    )
+
+
+def test_wait_ms_timing_emitted_for_waiter(monkeypatch):
+    """
+    inflight_guard.wait_ms must be emitted with a non-negative value for
+    every waiter thread, regardless of whether the event fires normally or
+    via a timeout.
+
+    Debugging use-case
+    ------------------
+    * wait_ms ≪ query_duration  →  guard saved work (waiter barely blocked)
+    * wait_ms ≈ query_duration  →  guard added latency (waiter waited as long
+      as the query took; no net benefit vs executing independently)
+    * wait_ms ≈ timeout         →  guard timed out; check timeout counter
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-wait-ms-key"
+    thread1_inside = threading.Event()
+    thread2_done = threading.Event()
+
+    def thread1_fn() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread2_done.wait(timeout=5)
+
+    def thread2_fn() -> None:
+        thread1_inside.wait(timeout=5)
+        with inflight_guard(key):
+            pass
+        thread2_done.set()
+
+    t1 = threading.Thread(target=thread1_fn)
+    t2 = threading.Thread(target=thread2_fn)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    timing_keys = [k for k, _ in fake_stats.timing_calls]
+    assert "inflight_guard.wait_ms" in timing_keys, (
+        "inflight_guard.wait_ms timing was not emitted for the coalesced waiter"
+    )
+    wait_ms_values = [v for k, v in fake_stats.timing_calls if k == "inflight_guard.wait_ms"]
+    assert all(v >= 0 for v in wait_ms_values), (
+        f"inflight_guard.wait_ms must be non-negative; got {wait_ms_values}"
+    )
+
+
+def test_timeout_counter_emitted_on_guard_timeout(monkeypatch):
+    """
+    inflight_guard.timeout must be incremented when event.wait() times out.
+
+    Debugging use-case
+    ------------------
+    If timeout counter is high AND latency is not improving, the winner query
+    is regularly exceeding QUERY_INFLIGHT_TIMEOUT_S.  In that scenario waiters
+    block for the full timeout before a takeover occurs, so the guard is
+    adding latency, not saving work.  Remedies: lower QUERY_INFLIGHT_TIMEOUT_S,
+    optimise the slow query, or add a DB-side query timeout.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-timeout-key"
+    original_timeout = query_cache_module._INFLIGHT_WAIT_TIMEOUT_S
+    query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = 0.05
+
+    thread1_inside = threading.Event()
+    thread1_allowed_to_exit = threading.Event()
+
+    def slow_thread() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread1_allowed_to_exit.wait(timeout=10)
+
+    def waiter_thread() -> None:
+        thread1_inside.wait(timeout=5)
+        with inflight_guard(key):
+            pass
+
+    try:
+        t1 = threading.Thread(target=slow_thread)
+        tw = threading.Thread(target=waiter_thread)
+        t1.start()
+        thread1_inside.wait(timeout=5)
+        tw.start()
+        tw.join(timeout=5)
+        thread1_allowed_to_exit.set()
+        t1.join(timeout=5)
+    finally:
+        query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout
+
+    assert "inflight_guard.timeout" in fake_stats.incr_calls, (
+        "inflight_guard.timeout counter was not emitted when the guard wait timed out"
+    )
+
+
+def test_takeover_counter_emitted_on_takeover(monkeypatch):
+    """
+    inflight_guard.takeover must be incremented exactly once when a
+    timeout-waiter wins the takeover race and becomes the new executor.
+
+    Debugging use-case
+    ------------------
+    Each takeover represents one extra query execution beyond what was
+    intended.  In steady state this should be near zero.  Spikes indicate
+    queries routinely slower than the guard timeout — investigate with
+    wait_ms and the underlying query duration metrics.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-takeover-key"
+    original_timeout = query_cache_module._INFLIGHT_WAIT_TIMEOUT_S
+    query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = 0.05
+
+    thread1_inside = threading.Event()
+    thread1_allowed_to_exit = threading.Event()
+
+    def slow_thread() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread1_allowed_to_exit.wait(timeout=10)
+
+    def waiter_thread() -> None:
+        thread1_inside.wait(timeout=5)
+        with inflight_guard(key):
+            pass
+
+    try:
+        t1 = threading.Thread(target=slow_thread)
+        tw = threading.Thread(target=waiter_thread)
+        t1.start()
+        thread1_inside.wait(timeout=5)
+        tw.start()
+        tw.join(timeout=5)
+        thread1_allowed_to_exit.set()
+        t1.join(timeout=5)
+    finally:
+        query_cache_module._INFLIGHT_WAIT_TIMEOUT_S = original_timeout
+
+    assert "inflight_guard.takeover" in fake_stats.incr_calls, (
+        "inflight_guard.takeover counter was not emitted for the takeover executor"
+    )
+
+
+def test_first_thread_emits_no_waiter_metrics(monkeypatch):
+    """
+    The first (winner) thread must NOT emit deduped, wait_ms, timeout, or
+    takeover metrics — those are waiter-only signals.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    with inflight_guard("obs-first-only-key"):
+        pass
+
+    waiter_metrics = {
+        "inflight_guard.deduped",
+        "inflight_guard.wait_ms",
+        "inflight_guard.timeout",
+        "inflight_guard.takeover",
+    }
+    emitted = set(fake_stats.incr_calls) | {k for k, _ in fake_stats.timing_calls}
+    unexpected = waiter_metrics & emitted
+    assert not unexpected, (
+        f"Winner thread emitted waiter-only metrics: {unexpected}"
+    )

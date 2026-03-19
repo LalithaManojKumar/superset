@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
@@ -137,6 +138,63 @@ _INFLIGHT_WAIT_TIMEOUT_S = 60
 _ERROR_SENTINEL_TTL_S = 30
 
 
+def _emit_stat(stat_key: str, value: float | None = None) -> None:
+    """Emit a counter or timing stat, silently ignoring missing app context.
+
+    Parameters
+    ----------
+    stat_key:
+        The metric name to increment or record.
+    value:
+        When ``None`` (default) a counter (``incr``) is emitted.  When a
+        float is supplied a timing value in milliseconds (``timing``) is
+        emitted instead.
+
+    This helper is used by :func:`inflight_guard` to expose observability
+    metrics that let operators distinguish between two very different
+    outcomes that can both produce a "high dedupe hit rate":
+
+    * **Good outcome** – waiters coalesce on a single fast query; wait_ms
+      is small and overall dashboard latency drops proportionally.
+    * **Bad outcome** – waiters coalesce on a slow query (or one that times
+      out and triggers a takeover); wait_ms is large and end-to-end latency
+      is dominated by guard wait rather than DB query time.
+
+    Metric reference
+    ----------------
+    ``inflight_guard.deduped``
+        Counter incremented each time a thread coalesces instead of
+        executing its own query.  High values = high dedupe hit rate.
+    ``inflight_guard.wait_ms``
+        Timing (ms) of how long a coalesced thread actually blocked.
+        If this is comparable to the DB query duration, the guard is
+        adding wait time rather than saving work — investigate why the
+        winner is slow (check ``inflight_guard.timeout``).
+    ``inflight_guard.timeout``
+        Counter incremented when a waiter's ``event.wait()`` call times
+        out before the winner finishes.  Non-zero values mean the original
+        query is exceeding ``QUERY_INFLIGHT_TIMEOUT_S`` / the webserver
+        timeout.  High values combined with high latency → the guard is
+        adding wait time; reduce the timeout or optimise the underlying
+        query.
+    ``inflight_guard.takeover``
+        Counter incremented when a timeout-waiter successfully takes over
+        execution.  Each takeover means one extra query execution.  In
+        steady state this should be near zero; spikes indicate queries that
+        routinely exceed the guard timeout.
+    """
+    try:
+        stats_logger = current_app.config["STATS_LOGGER"]
+        if value is None:
+            stats_logger.incr(stat_key)
+        else:
+            stats_logger.timing(stat_key, value)
+    except RuntimeError:
+        # No active Flask application context (e.g. unit tests that call
+        # inflight_guard directly without a Flask app).  Safe to ignore.
+        pass
+
+
 def _get_inflight_timeout() -> int:
     """Return the configured inflight-guard wait timeout in seconds.
 
@@ -252,13 +310,26 @@ def inflight_guard(
         logger.debug(
             "Single-flight: waiting for in-flight query with cache key: %s", cache_key
         )
+        # --- Observability: dedupe hit ----------------------------------------
+        # Count every thread that coalesces instead of executing its own query.
+        # Pair with wait_ms below to distinguish "guard saved work" (low wait_ms)
+        # from "guard just added latency" (wait_ms ≈ full query duration).
+        _emit_stat("inflight_guard.deduped")
+        _wait_start = time.monotonic()
         was_set = event.wait(timeout=timeout)
+        # Emit how long this thread actually blocked regardless of outcome.
+        _emit_stat("inflight_guard.wait_ms", (time.monotonic() - _wait_start) * 1000)
 
         if not was_set:
             # The wait timed out: the original executor is still running.
             # Race all timeout-waiters: the FIRST to win the lock atomically
             # replaces the original event and becomes the new executor.
             # All losers discover the replacement and wait for the winner.
+            # --- Observability: timeout ----------------------------------------
+            # A non-zero timeout counter means the original query is exceeding
+            # QUERY_INFLIGHT_TIMEOUT_S.  High timeouts + high latency → the
+            # guard is adding wait time; reduce the timeout or fix the query.
+            _emit_stat("inflight_guard.timeout")
             logger.warning(
                 "Single-flight: guard timed out after %ss for cache key '%s'. "
                 "Original query is still running. "
@@ -278,6 +349,11 @@ def inflight_guard(
                     current_event = _inflight_events.get(cache_key)
 
             if is_takeover:
+                # --- Observability: takeover -----------------------------------
+                # Each takeover = one extra query execution beyond the original.
+                # In steady state this should be near zero; spikes indicate
+                # queries routinely exceeding the guard timeout.
+                _emit_stat("inflight_guard.takeover")
                 logger.warning(
                     "Single-flight: this thread is taking over execution "
                     "for cache key '%s'.",
