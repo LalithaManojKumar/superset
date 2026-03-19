@@ -974,3 +974,60 @@ def test_first_thread_emits_no_waiter_metrics(monkeypatch):
     assert not unexpected, (
         f"Winner thread emitted waiter-only metrics: {unexpected}"
     )
+
+
+def test_lock_wait_ms_timing_emitted_for_every_thread(monkeypatch):
+    """
+    inflight_guard.lock_wait_ms must be emitted for EVERY thread (first and
+    waiter alike) so operators can detect when _inflight_lock is becoming a
+    serialisation bottleneck under high concurrency.
+
+    Debugging use-case
+    ------------------
+    Under low load lock_wait_ms is near-zero (uncontended).  Sustained values
+    above ~1 ms mean many threads are competing simultaneously for the same
+    process-level lock, which is a signal to investigate dashboard fan-out or
+    consider sharding the inflight table by key prefix.
+    """
+    fake_stats = _make_fake_stats_logger()
+    monkeypatch.setattr(
+        query_cache_module,
+        "_emit_stat",
+        lambda key, value=None: (
+            fake_stats.incr(key) if value is None else fake_stats.timing(key, value)
+        ),
+    )
+
+    key = "obs-lock-wait-key"
+    thread1_inside = threading.Event()
+    thread2_done = threading.Event()
+
+    def thread1_fn() -> None:
+        with inflight_guard(key):
+            thread1_inside.set()
+            thread2_done.wait(timeout=5)
+
+    def thread2_fn() -> None:
+        thread1_inside.wait(timeout=5)
+        with inflight_guard(key):
+            pass
+        thread2_done.set()
+
+    t1 = threading.Thread(target=thread1_fn)
+    t2 = threading.Thread(target=thread2_fn)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    timing_keys = [k for k, _ in fake_stats.timing_calls]
+    lock_wait_count = timing_keys.count("inflight_guard.lock_wait_ms")
+    # Both the winner (thread1) and the waiter (thread2) must emit this metric.
+    assert lock_wait_count >= 2, (
+        f"Expected lock_wait_ms from at least 2 threads, got {lock_wait_count}. "
+        f"Timing calls: {fake_stats.timing_calls}"
+    )
+    lock_wait_values = [v for k, v in fake_stats.timing_calls if k == "inflight_guard.lock_wait_ms"]
+    assert all(v >= 0 for v in lock_wait_values), (
+        f"inflight_guard.lock_wait_ms must be non-negative; got {lock_wait_values}"
+    )

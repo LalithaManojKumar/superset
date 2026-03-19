@@ -182,6 +182,14 @@ def _emit_stat(stat_key: str, value: float | None = None) -> None:
         execution.  Each takeover means one extra query execution.  In
         steady state this should be near zero; spikes indicate queries that
         routinely exceed the guard timeout.
+    ``inflight_guard.lock_wait_ms``
+        Timing (ms) of how long a thread waited to acquire ``_inflight_lock``
+        during the initial first-vs-waiter classification step.  Under low
+        load this will be near zero.  Sustained values above ~1 ms indicate
+        high lock contention — many threads competing simultaneously for the
+        same lock — which is a signal that the per-process inflight table is
+        becoming a serialisation bottleneck and should be investigated (e.g.
+        by sharding keys or reducing dashboard request fan-out).
     """
     try:
         stats_logger = current_app.config["STATS_LOGGER"]
@@ -297,7 +305,16 @@ def inflight_guard(
 
     timeout = _get_inflight_timeout()
 
+    # --- Observability: lock contention ----------------------------------------
+    # Time how long it takes to acquire _inflight_lock.  Under low load this is
+    # near-instantaneous; sustained values above ~1 ms indicate many threads
+    # competing simultaneously and the lock becoming a bottleneck.
+    _lock_start = time.monotonic()
     with _inflight_lock:
+        _emit_stat(
+            "inflight_guard.lock_wait_ms",
+            (time.monotonic() - _lock_start) * 1000,
+        )
         if cache_key in _inflight_events:
             event = _inflight_events[cache_key]
             is_first = False
