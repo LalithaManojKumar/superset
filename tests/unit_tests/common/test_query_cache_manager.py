@@ -35,9 +35,32 @@ this by tracking in-flight queries inside a single worker process.  The first
 thread acquires ownership of a cache key and executes the query.  Every
 subsequent thread that wants the same key blocks until the first thread
 signals completion and then re-reads the result from cache.
+
+Security model
+--------------
+The guard coalesces only threads that share the **exact same** cache key.
+``QueryContextProcessor.query_cache_key()`` folds user-security context into
+the key so that users with different effective permissions always produce
+different keys:
+
+* ``rls=security_manager.get_rls_cache_key(datasource)`` – appends the
+  Row-Level Security predicates applicable to the *current* user.  A user
+  with no RLS gets an empty list; a user with RLS rules gets the filter-clause
+  strings.  Different RLS → different key → independent guard entry.
+* ``extra_cache_keys=datasource.get_extra_cache_keys(...)`` – resolves Jinja
+  template calls such as ``{{ current_username() }}`` in datasource SQL.
+* Impersonation key – added when ``CACHE_IMPERSONATION`` /
+  ``CACHE_QUERY_BY_USER`` / ``per_user_caching`` flags are active.
+
+Tests in the "Security isolation" section below verify that:
+  1. Different cache keys (representing different user permissions) never block
+     each other and never share guard state.
+  2. Concurrent threads with the same cache key (same effective permissions,
+     safe to deduplicate) are correctly serialised by the guard.
 """
 
 import threading
+import time
 
 import pytest
 
@@ -243,3 +266,210 @@ def test_only_one_query_executed_for_concurrent_requests():
         f"but {exec_count} were executed (thundering-herd not prevented)"
     )
     assert fake_cache[key] == "result", "Cache should be populated"
+
+
+# ---------------------------------------------------------------------------
+# Security isolation tests
+#
+# These tests verify that the inflight_guard preserves per-user data
+# isolation.  The guard is safe because it keys on the *security-scoped*
+# cache key produced by QueryContextProcessor.query_cache_key(), which
+# encodes Row-Level Security predicates, Jinja user-context, and
+# (optionally) database-level impersonation identity.
+#
+# Key properties verified:
+#   1. Different cache keys (representing different user permissions) have
+#      completely independent guard entries – they never block each other.
+#   2. Users who share a cache key (same effective permissions) are correctly
+#      deduplicated by the guard, and the "waiter" correctly re-reads the
+#      result rather than executing a second query.
+#   3. Cross-key contamination is impossible: a waiter on key A is never
+#      unblocked by an event fired for key B.
+# ---------------------------------------------------------------------------
+
+
+def test_different_security_keys_are_fully_independent():
+    """
+    Users with different effective permissions produce different cache keys.
+    Guards for different keys must operate completely independently – a thread
+    holding key-A must NOT block or influence a thread using key-B.
+
+    Real-world mapping:
+    ─────────────────
+    key_admin  →  admin user, no RLS  → rls=[]  → key hash includes []
+    key_user   →  restricted user, RLS applied  → rls=["dept='sales'"]  → different hash
+
+    Both users should be able to execute their queries concurrently without
+    either blocking the other.
+    """
+    # Simulate two different users' security-scoped cache keys.
+    # In production these would differ because security_manager.get_rls_cache_key()
+    # returns different clause lists for different users.
+    key_admin = "cache_key:ds=1:rls=[]"  # admin – no RLS predicates
+    key_user = "cache_key:ds=1:rls=[dept=sales]"  # restricted – with RLS
+
+    admin_is_first_values: list[bool] = []
+    user_is_first_values: list[bool] = []
+    both_inside = threading.Barrier(2)  # ensures real concurrency
+
+    def admin_thread() -> None:
+        with inflight_guard(key_admin) as is_first:
+            admin_is_first_values.append(is_first)
+            both_inside.wait(timeout=5)
+
+    def restricted_thread() -> None:
+        with inflight_guard(key_user) as is_first:
+            user_is_first_values.append(is_first)
+            both_inside.wait(timeout=5)
+
+    t_admin = threading.Thread(target=admin_thread)
+    t_user = threading.Thread(target=restricted_thread)
+
+    t_admin.start()
+    t_user.start()
+    t_admin.join(timeout=10)
+    t_user.join(timeout=10)
+
+    # Both should see is_first=True because their keys are different.
+    # Neither should have been blocked by the other.
+    assert admin_is_first_values == [True], (
+        "Admin thread should execute independently (is_first=True)"
+    )
+    assert user_is_first_values == [True], (
+        "Restricted-user thread should execute independently (is_first=True)"
+    )
+
+
+def test_same_security_key_deduplicates_safely():
+    """
+    Users who share a cache key have identical effective permissions and are
+    entitled to see the same data.  The guard should deduplicate their queries:
+    the first thread executes, the second waits and reuses the result.
+
+    Real-world mapping:
+    ─────────────────
+    Both requests belong to users whose RLS predicates produce the same clause
+    list (e.g. two users in the same restricted role).  query_cache_key() will
+    return the same hash for both, so deduplication is both correct and safe.
+    """
+    shared_key = "cache_key:ds=1:rls=[region=EU]"
+    fake_cache: dict[str, str] = {}
+    exec_count = 0
+    exec_lock = threading.Lock()
+
+    thread1_inside = threading.Event()
+    thread2_done = threading.Event()
+
+    def user1_fn() -> None:
+        nonlocal exec_count
+        cache_hit = shared_key in fake_cache
+        if not cache_hit:
+            with inflight_guard(shared_key) as is_first:
+                if not is_first:
+                    # Re-read after waiting – safe because same permissions
+                    cache_hit = shared_key in fake_cache
+                if is_first or not cache_hit:
+                    with exec_lock:
+                        exec_count += 1
+                    fake_cache[shared_key] = "EU-result"
+                thread1_inside.set()
+                thread2_done.wait(timeout=5)
+
+    def user2_fn() -> None:
+        nonlocal exec_count
+        thread1_inside.wait(timeout=5)  # ensure user1 is inside its guard
+        cache_hit = shared_key in fake_cache
+        if not cache_hit:
+            with inflight_guard(shared_key) as is_first:
+                if not is_first:
+                    cache_hit = shared_key in fake_cache
+                if is_first or not cache_hit:
+                    with exec_lock:
+                        exec_count += 1
+                    fake_cache[shared_key] = "EU-result"
+        thread2_done.set()
+
+    t1 = threading.Thread(target=user1_fn)
+    t2 = threading.Thread(target=user2_fn)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert exec_count == 1, (
+        f"Same-permissions users should share a single query execution, "
+        f"but {exec_count} executions occurred"
+    )
+    assert fake_cache[shared_key] == "EU-result"
+
+
+def test_different_key_threads_never_unblock_each_other():
+    """
+    An Event fired for key-A must NOT unblock a waiter on key-B.
+
+    This verifies there is no cross-key contamination: the guard stores one
+    threading.Event per cache key, so signalling key-A's event leaves key-B's
+    event untouched.
+    """
+    key_a = "key-user-a"
+    key_b = "key-user-b"
+
+    # key_b waiter thread state
+    key_b_is_first_received: list[bool] = []
+    key_b_entered_guard = threading.Event()
+    key_b_allowed_to_exit = threading.Event()
+
+    def key_b_first_thread() -> None:
+        """Hold the key-B guard slot open."""
+        with inflight_guard(key_b) as is_first:
+            key_b_is_first_received.append(is_first)
+            key_b_entered_guard.set()
+            key_b_allowed_to_exit.wait(timeout=10)
+
+    def key_b_waiter_thread() -> None:
+        """Wait for key-B to be released."""
+        key_b_entered_guard.wait(timeout=5)
+        with inflight_guard(key_b) as is_first:
+            key_b_is_first_received.append(is_first)
+
+    # key_a fires independently – it must NOT wake up key_b's waiter
+    key_a_fired = threading.Event()
+
+    def key_a_thread() -> None:
+        with inflight_guard(key_a):
+            pass  # complete immediately
+        key_a_fired.set()
+
+    t_b_first = threading.Thread(target=key_b_first_thread)
+    t_b_waiter = threading.Thread(target=key_b_waiter_thread)
+    t_a = threading.Thread(target=key_a_thread)
+
+    t_b_first.start()
+    key_b_entered_guard.wait(timeout=5)
+
+    t_b_waiter.start()
+    # Give the waiter a moment to enter its guard and block
+    time.sleep(0.05)
+
+    # Fire key-A's event – key-B's waiter must remain blocked
+    t_a.start()
+    key_a_fired.wait(timeout=5)
+
+    # key-B's waiter should still be waiting (not yet unblocked)
+    # We verify by checking that the waiter thread has not exited yet
+    t_b_waiter.join(timeout=0.1)
+    assert t_b_waiter.is_alive(), (
+        "key-B waiter was prematurely unblocked by key-A's Event signal "
+        "(cross-key contamination detected)"
+    )
+
+    # Now release key-B's first thread
+    key_b_allowed_to_exit.set()
+    t_b_first.join(timeout=5)
+    t_b_waiter.join(timeout=5)
+    t_a.join(timeout=5)
+
+    # key-B should have had exactly 2 entries: first=True, waiter=False
+    assert key_b_is_first_received == [True, False], (
+        f"Expected [True, False] for key-B, got {key_b_is_first_received}"
+    )

@@ -65,6 +65,23 @@ _cache: dict[CacheRegion, Cache] = {
 #   Once the first thread completes (success *or* failure) it fires the Event
 #   so that all waiters are unblocked and can re-read from cache.
 #
+# Security model – how per-user isolation is maintained:
+# ---------------------------------------------------------------------------
+#   The guard key is the *security-scoped* cache key produced by
+#   QueryContextProcessor.query_cache_key(), which already encodes:
+#     • Row-Level Security predicates for the current user (via
+#       security_manager.get_rls_cache_key()), including guest-token RLS
+#     • Jinja template user-context (current_username(), current_user_id(),
+#       url_param(), etc.) resolved at request time and appended via
+#       datasource.get_extra_cache_keys()
+#     • Database-level impersonation identity when CACHE_IMPERSONATION,
+#       CACHE_QUERY_BY_USER, or per_user_caching options are active
+#
+#   Consequence: two users with *different* effective permissions produce
+#   different cache keys → different guard keys → they never block each other
+#   and never share cached results.  The guard coalesces requests only when
+#   the callers would see the exact same data, making deduplication safe.
+#
 # Scope and limitations:
 #   * Only protects threads within the same worker process (e.g. Gunicorn
 #     threaded or gevent worker).  Across separate processes the shared cache
@@ -103,6 +120,35 @@ def inflight_guard(
     When *cache_key* is ``None`` (e.g. force_query mode or no key available)
     the guard is a no-op and always yields ``True`` so the caller executes
     unconditionally.
+
+    Security contract
+    -----------------
+    The guard coalesces concurrent threads that share the **exact same**
+    *cache_key*.  It is the **caller's responsibility** to pass a key that
+    already encodes all user-specific security context so that two threads
+    representing users with different data-access rights never share a key.
+
+    In practice this means callers must use the key produced by
+    ``QueryContextProcessor.query_cache_key()``, which folds in:
+
+    * **RLS predicates** – via ``security_manager.get_rls_cache_key()``,
+      resolved for the *current* Flask-request user.  A user with no RLS rules
+      gets an empty list; a user with RLS rules gets the list of applicable
+      filter clauses.  Different lists → different keys → different guards.
+    * **Jinja user-context** – via ``datasource.get_extra_cache_keys()``.
+      Template functions such as ``current_username()``, ``current_user_id()``,
+      and ``url_param()`` are evaluated at request time and appended to the
+      key, differentiating per-user filtered virtual datasets.
+    * **Impersonation identity** – when ``CACHE_IMPERSONATION``,
+      ``CACHE_QUERY_BY_USER``, or ``per_user_caching`` flags are active, the
+      database-level username is included so that impersonated sessions produce
+      distinct cache buckets.
+
+    Because of these inclusions, two requests for the same raw payload but
+    with different effective permissions will produce different cache keys and
+    therefore use independent guards.  The guard will **never** cause a
+    restricted user to receive data that was fetched in the context of a less-
+    restricted user.
 
     Usage::
 

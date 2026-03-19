@@ -232,8 +232,45 @@ class QueryContextProcessor:
         }
 
     def query_cache_key(self, query_obj: QueryObject, **kwargs: Any) -> str | None:
-        """
-        Returns a QueryObject cache key for objects in self.queries
+        """Return a security-scoped cache key for *query_obj*.
+
+        The key encodes **all** factors that affect what data a specific user
+        is allowed to see, so that two requests with different effective
+        permissions always produce distinct keys and therefore never share
+        cached results.
+
+        User-context factors included in the key
+        -----------------------------------------
+        rls (Row-Level Security predicates)
+            ``security_manager.get_rls_cache_key(datasource)`` returns the RLS
+            filter clauses that apply to the **current** Flask-request user,
+            including both regular RLS rules (scoped by role) and guest-token
+            RLS rules for embedded analytics.  Users with no matching RLS rules
+            receive an empty list; users with different rules receive different
+            lists — and therefore different cache keys.
+
+        extra_cache_keys (Jinja template user-context)
+            ``datasource.get_extra_cache_keys()`` evaluates any Jinja template
+            calls in the datasource SQL (e.g. ``{{ current_username() }}``,
+            ``{{ current_user_id() }}``, ``{{ url_param(...) }}``) and appends
+            their resolved values to the key.  This ensures datasets that
+            filter on the calling user produce per-user cache entries.
+
+        impersonation_key (database-level user identity)
+            When the ``CACHE_IMPERSONATION``, ``CACHE_QUERY_BY_USER``, or
+            ``per_user_caching`` (database extra) options are active,
+            ``query_obj.cache_key()`` appends the database-level username so
+            that per-user impersonation produces separate cache buckets.
+
+        When two requests share a key
+        ------------------------------
+        Two requests share a key only when all of the above factors are
+        identical — meaning the users have the same RLS rules, the same
+        resolved Jinja context, and (if impersonation is active) the same
+        database identity.  In that case they are entitled to see the exact
+        same data, so sharing a cached result is both safe and correct.  This
+        is also the only scenario where ``inflight_guard`` will coalesce them
+        into a single database round-trip.
         """
         datasource = self._qc_datasource
         extra_cache_keys = datasource.get_extra_cache_keys(query_obj.to_dict())
