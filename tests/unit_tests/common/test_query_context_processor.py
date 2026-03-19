@@ -718,6 +718,7 @@ def test_ensure_totals_available_updates_cache_values():
     mock_datasource = MagicMock()
     mock_datasource.uid = "test_datasource"
     mock_datasource.database.db_engine_spec.engine = "postgresql"
+    mock_datasource.database.extra = None  # json.loads(None or "{}") = {}
     mock_datasource.cache_timeout = None
     mock_datasource.changed_on = None
 
@@ -800,38 +801,54 @@ def test_ensure_totals_available_updates_cache_values():
     )
     mock_query_result.df = mock_df
 
-    with patch.object(
-        mock_query_context, "get_query_result", return_value=mock_query_result
+    # ensure_totals_available() now uses QueryCacheManager instead of calling
+    # _query_context.get_query_result() directly. Mock both the cache and the
+    # underlying query execution so the test remains self-contained.
+    with (
+        patch(
+            "superset.common.query_context_processor.QueryCacheManager"
+        ) as mock_cache_manager,
+        patch.object(
+            processor, "query_cache_key", return_value="test_totals_cache_key"
+        ),
+        patch.object(processor, "get_cache_timeout", return_value=3600),
     ):
-        # Call ensure_totals_available
-        processor.ensure_totals_available()
+        # Return a cache miss so the query is executed via get_query_result
+        cache_miss = MagicMock()
+        cache_miss.is_loaded = False
+        cache_miss.df = mock_df
 
-        # Now call get_payload which should update cache_values
-        with patch(
-            "superset.common.query_context_processor.get_query_results"
-        ) as mock_get_query_results:
-            # Mock the query results
-            mock_query_results_response = [
-                {
-                    "data": [{"brokerage": "Test", "Net Amount In": 100}],
-                    "query": "SELECT ...",
-                }
-            ]
-            mock_get_query_results.return_value = mock_query_results_response
+        # Return a cache hit for any subsequent get() calls (e.g. from get_payload).
+        # The df must match mock_df so that re-computing totals inside get_payload
+        # produces the same expected values as the first ensure_totals_available call.
+        cache_hit = MagicMock()
+        cache_hit.is_loaded = True
+        cache_hit.df = mock_df
+        cache_hit.query = "SELECT ..."
+        cache_hit.error_message = None
+        cache_hit.status = "success"
 
-            # Mock cache manager to avoid actual caching
+        # First call (from ensure_totals_available) → miss; further calls → hit
+        mock_cache_manager.get.side_effect = [cache_miss, cache_hit, cache_hit]
+
+        with patch.object(
+            processor, "get_query_result", return_value=mock_query_result
+        ):
+            # Call ensure_totals_available
+            processor.ensure_totals_available()
+
+            # Now call get_payload which should update cache_values
             with patch(
-                "superset.common.query_context_processor.QueryCacheManager"
-            ) as mock_cache_manager:
-                mock_cache = MagicMock()
-                mock_cache.is_loaded = True
-                mock_cache.df = pd.DataFrame(
-                    {"brokerage": ["Test"], "Net Amount In": [100]}
-                )
-                mock_cache.query = "SELECT ..."
-                mock_cache.error_message = None
-                mock_cache.status = "success"
-                mock_cache_manager.get.return_value = mock_cache
+                "superset.common.query_context_processor.get_query_results"
+            ) as mock_get_query_results:
+                # Mock the query results
+                mock_query_results_response = [
+                    {
+                        "data": [{"brokerage": "Test", "Net Amount In": 100}],
+                        "query": "SELECT ...",
+                    }
+                ]
+                mock_get_query_results.return_value = mock_query_results_response
 
                 # This should update cache_values to match the modified queries
                 processor.get_payload(cache_query_context=False)
@@ -958,6 +975,7 @@ def test_cache_values_sync_after_ensure_totals_available():
     mock_datasource = MagicMock()
     mock_datasource.uid = "test_datasource_456"
     mock_datasource.database.db_engine_spec.engine = "pinot"
+    mock_datasource.database.extra = None  # json.loads(None or "{}") = {}
     mock_datasource.cache_timeout = None
     mock_datasource.changed_on = None
 
@@ -1014,8 +1032,15 @@ def test_cache_values_sync_after_ensure_totals_available():
     mock_query_result.df = mock_df
 
     # Patch methods to isolate the test
-    with patch.object(
-        mock_query_context, "get_query_result", return_value=mock_query_result
+    # ensure_totals_available() now calls query_cache_key(); patch it so
+    # simplejson serialization issues with MagicMock attributes are avoided.
+    with (
+        patch.object(
+            processor,
+            "query_cache_key",
+            side_effect=["totals_key", "main_key", "totals_key"],
+        ),
+        patch.object(processor, "get_cache_timeout", return_value=3600),
     ):
         # Mock cache management to prevent actual caching
         with patch(
@@ -1309,7 +1334,16 @@ def test_force_cached_normalizes_totals_query_row_limit():
 
             processor.get_payload(cache_query_context=False, force_cached=True)
 
-    assert captured_limits == [None], "Totals query should be normalized before caching"
+    # The totals cache key is now computed once in get_payload() for deduplication
+    # and once in get_df_payload(); both calls should see row_limit=None confirming
+    # that normalization happens before any cache key is generated.
+    assert len(captured_limits) >= 1, (
+        "Totals cache key should be generated at least once"
+    )
+    assert all(limit is None for limit in captured_limits), (
+        "Totals query should be normalized (row_limit=None) before caching; "
+        f"got: {captured_limits}"
+    )
     mock_query_context.get_query_result.assert_not_called()
 
 
@@ -1379,3 +1413,187 @@ def test_get_df_payload_invalidates_cache_missing_applied_filter_columns():
     assert mock_cache.is_loaded is False, (
         "Cache should be inv when no applied_filter_columns and query has filters"
     )
+
+
+def test_ensure_totals_available_uses_cache_on_hit():
+    """
+    ensure_totals_available() should not execute the totals query when
+    the result is already in the cache (QueryCacheManager returns is_loaded=True).
+    This prevents a double database round-trip for contribution charts.
+    """
+    import pandas as pd
+
+    from superset.common.query_object import QueryObject
+
+    mock_datasource = MagicMock()
+    mock_datasource.uid = "ds_cache_hit"
+    mock_datasource.database.extra = None
+    mock_datasource.cache_timeout = None
+    mock_datasource.changed_on = None
+
+    totals_query = QueryObject(
+        datasource=mock_datasource,
+        columns=[],
+        metrics=["revenue"],
+        row_limit=500,
+        post_processing=[],
+    )
+    main_query = QueryObject(
+        datasource=mock_datasource,
+        columns=["product"],
+        metrics=["revenue"],
+        row_limit=500,
+        post_processing=[{"operation": "contribution", "options": {}}],
+    )
+
+    mock_query_context = MagicMock()
+    mock_query_context.force = False
+    mock_query_context.datasource = mock_datasource
+    mock_query_context.queries = [main_query, totals_query]
+
+    processor = QueryContextProcessor(mock_query_context)
+    processor._qc_datasource = mock_datasource
+
+    cached_df = pd.DataFrame({"revenue": [9000.0]})
+
+    with (
+        patch.object(processor, "query_cache_key", return_value="totals_cache_key"),
+        patch.object(processor, "get_cache_timeout", return_value=3600),
+        patch(
+            "superset.common.query_context_processor.QueryCacheManager"
+        ) as mock_cache_manager,
+        patch.object(processor, "get_query_result") as mock_get_query_result,
+    ):
+        # Cache returns a hit – get_query_result should NOT be called.
+        cache_hit = MagicMock()
+        cache_hit.is_loaded = True
+        cache_hit.df = cached_df
+        mock_cache_manager.get.return_value = cache_hit
+
+        processor.ensure_totals_available()
+
+        mock_get_query_result.assert_not_called()
+
+    # contribution_totals should be populated from the cached df
+    assert main_query.post_processing[0]["options"]["contribution_totals"] == {
+        "revenue": 9000.0
+    }
+
+
+def test_ensure_totals_available_populates_cache_on_miss():
+    """
+    ensure_totals_available() should store the totals query result in the cache
+    when it is not already there (cache miss).  A subsequent get_df_payload() call
+    for the same totals query should then find the result in cache and not hit the
+    database a second time.
+    """
+    import pandas as pd
+
+    from superset.common.query_object import QueryObject
+
+    mock_datasource = MagicMock()
+    mock_datasource.uid = "ds_cache_miss"
+    mock_datasource.database.extra = None
+    mock_datasource.cache_timeout = None
+    mock_datasource.changed_on = None
+
+    totals_query = QueryObject(
+        datasource=mock_datasource,
+        columns=[],
+        metrics=["revenue"],
+        row_limit=500,
+        post_processing=[],
+    )
+    main_query = QueryObject(
+        datasource=mock_datasource,
+        columns=["product"],
+        metrics=["revenue"],
+        row_limit=500,
+        post_processing=[{"operation": "contribution", "options": {}}],
+    )
+
+    mock_query_context = MagicMock()
+    mock_query_context.force = False
+    mock_query_context.datasource = mock_datasource
+    mock_query_context.queries = [main_query, totals_query]
+
+    processor = QueryContextProcessor(mock_query_context)
+    processor._qc_datasource = mock_datasource
+
+    totals_df = pd.DataFrame({"revenue": [5000.0]})
+    mock_query_result = MagicMock()
+    mock_query_result.df = totals_df
+
+    with (
+        patch.object(processor, "query_cache_key", return_value="totals_cache_key"),
+        patch.object(processor, "get_cache_timeout", return_value=3600),
+        patch(
+            "superset.common.query_context_processor.QueryCacheManager"
+        ) as mock_cache_manager,
+        patch.object(
+            processor, "get_query_result", return_value=mock_query_result
+        ) as mock_get_query_result,
+    ):
+        # Cache returns a miss on first call.
+        cache_miss = MagicMock()
+        cache_miss.is_loaded = False
+        cache_miss.df = totals_df
+        mock_cache_manager.get.return_value = cache_miss
+
+        processor.ensure_totals_available()
+
+        # Database should be queried exactly once.
+        mock_get_query_result.assert_called_once_with(totals_query)
+        # Result should be stored in cache.
+        cache_miss.set_query_result.assert_called_once()
+
+    assert main_query.post_processing[0]["options"]["contribution_totals"] == {
+        "revenue": 5000.0
+    }
+
+
+def test_get_payload_deduplicates_identical_queries():
+    """
+    get_payload() should not execute the same query (identified by cache key) more
+    than once within a single payload computation.  When two QueryObjects share the
+    same cache key, the result of the first execution is reused for the second.
+    """
+
+    mock_query_context = MagicMock()
+    mock_query_context.force = False
+    mock_query_context.queries = [MagicMock(), MagicMock()]  # two identical-key queries
+    mock_query_context.cache_values = {"queries": [{}, {}]}
+
+    processor = QueryContextProcessor(mock_query_context)
+
+    # Both queries share the same cache key → only one get_query_results call expected.
+    shared_cache_key = "shared-key"
+
+    call_count: list[int] = []
+
+    def fake_get_query_results(
+        result_type: Any, qc: Any, query_obj: Any, force_cached: Any
+    ) -> dict[str, Any]:  # noqa: E501
+        call_count.append(1)
+        return {"data": [{"value": 42}], "query": "SELECT 42"}
+
+    with (
+        patch.object(processor, "query_cache_key", return_value=shared_cache_key),
+        patch.object(processor, "get_cache_timeout", return_value=3600),
+        patch.object(processor, "ensure_totals_available"),
+        patch(
+            "superset.common.query_context_processor.get_query_results",
+            side_effect=fake_get_query_results,
+        ),
+    ):
+        result = processor.get_payload(cache_query_context=False, force_cached=True)
+
+    assert len(call_count) == 1, (
+        "Expected get_query_results to be called once for two identical-key queries, "
+        f"but it was called {len(call_count)} time(s)"
+    )
+    assert len(result["queries"]) == 2, (
+        "Both query slots should be present in the result even when deduplicated"
+    )
+    # Both results should be the same object (deduplicated)
+    assert result["queries"][0] is result["queries"][1]

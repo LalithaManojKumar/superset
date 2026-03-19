@@ -308,8 +308,35 @@ class QueryContextProcessor:
 
         totals_query = self._query_context.queries[totals_idx]
 
-        result = self._query_context.get_query_result(totals_query)
-        df = result.df
+        # Use cache to avoid re-executing the totals query when get_df_payload()
+        # later processes the same query. On a cache hit the database is not touched;
+        # on a cache miss the result is stored so the subsequent get_df_payload() call
+        # can read it from cache instead of hitting the database a second time.
+        cache_key = self.query_cache_key(totals_query)
+        timeout = self.get_cache_timeout()
+        force_query = self._query_context.force or timeout == CACHE_DISABLED_TIMEOUT
+        cache = QueryCacheManager.get(
+            key=cache_key,
+            region=CacheRegion.DATA,
+            force_query=force_query,
+        )
+
+        if cache.is_loaded:
+            df = cache.df
+        else:
+            query_result = self.get_query_result(totals_query)
+            if cache_key:
+                cache.set_query_result(
+                    key=cache_key,
+                    query_result=query_result,
+                    force_query=force_query,
+                    timeout=timeout,
+                    datasource_uid=self._qc_datasource.uid,
+                    region=CacheRegion.DATA,
+                )
+                df = cache.df
+            else:
+                df = query_result.df
 
         totals = {
             col: df[col].sum() for col in df.columns if df[col].dtype.kind in "biufc"
@@ -350,15 +377,27 @@ class QueryContextProcessor:
                 )
             ]
 
-        query_results = [
-            get_query_results(
-                query_obj.result_type or self._query_context.result_type,
-                self._query_context,
-                query_obj,
-                force_cached,
-            )
-            for query_obj in self._query_context.queries
-        ]
+        # Deduplicate queries with the same cache key to avoid executing the same
+        # database query more than once within a single payload computation.
+        seen_results: dict[str, Any] = {}
+        query_results = []
+        for query_obj in self._query_context.queries:
+            cache_key = self.query_cache_key(query_obj)
+            if cache_key and cache_key in seen_results:
+                logger.debug(
+                    "Reusing result for duplicate query with cache key: %s", cache_key
+                )
+                query_results.append(seen_results[cache_key])
+            else:
+                result = get_query_results(
+                    query_obj.result_type or self._query_context.result_type,
+                    self._query_context,
+                    query_obj,
+                    force_cached,
+                )
+                if cache_key:
+                    seen_results[cache_key] = result
+                query_results.append(result)
 
         return_value = {"queries": query_results}
 
