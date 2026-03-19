@@ -17,8 +17,11 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Generator
 
 from flask import current_app
 from flask_caching import Cache
@@ -40,6 +43,440 @@ _cache: dict[CacheRegion, Cache] = {
     CacheRegion.DEFAULT: cache_manager.cache,
     CacheRegion.DATA: cache_manager.data_cache,
 }
+
+# ---------------------------------------------------------------------------
+# Single-flight / in-flight deduplication
+# ---------------------------------------------------------------------------
+# These module-level structures provide *within-process* single-flight
+# protection for query execution.
+#
+# Problem this solves (thundering-herd / dogpile):
+#   When a dashboard loads with N charts that share the same datasource and
+#   filters, each chart independently POSTs to /api/v1/chart/data.  All N
+#   requests reach get_df_payload() at roughly the same time and see a cache
+#   miss (the first request hasn't finished yet).  Without a guard they all
+#   execute the identical SQL query against the database.
+#
+# How it works:
+# ---------------------------------------------------------------------------
+#   The first thread to see a cache miss for a given cache_key acquires
+#   "ownership" by inserting a threading.Event into _inflight_events and
+#   yields is_first=True.  Subsequent threads that want the same key find the
+#   Event already there, yield is_first=False, and block on event.wait().
+#   Once the first thread completes (success *or* failure) it fires the Event
+#   so that all waiters are unblocked and can re-read from cache.
+#
+# Security model – how per-user isolation is maintained:
+# ---------------------------------------------------------------------------
+#   The guard key is the *security-scoped* cache key produced by
+#   QueryContextProcessor.query_cache_key(), which already encodes:
+#     • Row-Level Security predicates for the current user (via
+#       security_manager.get_rls_cache_key()), including guest-token RLS
+#     • Jinja template user-context (current_username(), current_user_id(),
+#       url_param(), etc.) resolved at request time and appended via
+#       datasource.get_extra_cache_keys()
+#     • Database-level impersonation identity when CACHE_IMPERSONATION,
+#       CACHE_QUERY_BY_USER, or per_user_caching options are active
+#
+#   Consequence: two users with *different* effective permissions produce
+#   different cache keys → different guard keys → they never block each other
+#   and never share cached results.  The guard coalesces requests only when
+#   the callers would see the exact same data, making deduplication safe.
+#
+# Scope and limitations:
+#   * Only protects threads within the same worker process (e.g. Gunicorn
+#     threaded or gevent worker).  Across separate processes the shared cache
+#     (Redis / Memcached) already provides eventual consistency – the second
+#     process to finish a query will simply overwrite the cached value with an
+#     identical result, which is harmless.
+#   * force_query=True bypasses the guard intentionally: the user has
+#     explicitly requested fresh data, so we should not coalesce that request.
+#
+# Timeout and "takeover" – the biggest production risk:
+# ---------------------------------------------------------------------------
+#   The frontend aborts HTTP requests instantly (via AbortController) when a
+#   user changes a dashboard filter.  The corresponding backend threads,
+#   however, continue waiting inside inflight_guard until the guard timeout
+#   expires.  If that timeout is much larger than the actual query runtime,
+#   threads pile up holding DB connections and thread-pool slots for requests
+#   that nobody will ever read.
+#
+#   When the timeout DOES fire, the original code woke ALL N−1 waiting threads
+#   simultaneously, causing each of them to retry the query — recreating the
+#   thundering herd.
+#
+#   The "takeover" mechanism (see inflight_guard below) fixes this: the FIRST
+#   timeout-waiter to wake up atomically replaces the in-flight event and
+#   becomes the new sole executor.  All other timeout-waiters see the new event
+#   and wait for the takeover thread to finish instead of executing themselves.
+#   This keeps the maximum concurrent executions at 2 (original + takeover)
+#   regardless of how many threads are waiting.
+#
+#   The timeout value defaults to SUPERSET_WEBSERVER_TIMEOUT at runtime so
+#   that backend threads do not outlive the HTTP connections they serve.
+#   Operators can override it via the QUERY_INFLIGHT_TIMEOUT_S config key.
+# ---------------------------------------------------------------------------
+# All reads and writes to _inflight_events MUST be done while holding
+# _inflight_lock to avoid TOCTOU races.  The lock is intentionally
+# short-held: we only hold it for the dictionary operation, then release it
+# before any blocking (event.wait) or yielding to caller code.
+_inflight_events: dict[str, threading.Event] = {}
+_inflight_lock = threading.Lock()
+
+#: Fallback timeout (seconds) used when no Flask application context is
+#: available (e.g. unit tests that call inflight_guard directly).  In
+#: production the runtime value is read from QUERY_INFLIGHT_TIMEOUT_S or
+#: SUPERSET_WEBSERVER_TIMEOUT via _get_inflight_timeout().
+_INFLIGHT_WAIT_TIMEOUT_S = 60
+
+#: TTL (seconds) for the short-lived error sentinels written to the shared
+#: cache backend when the "winner" thread of an inflight_guard fails.
+#: Waiting threads read this sentinel and return the cached failure
+#: immediately instead of all re-executing the same failing query.  The TTL
+#: is kept short so that transient failures (e.g. brief DB unavailability)
+#: do not suppress later successful queries for longer than necessary.
+_ERROR_SENTINEL_TTL_S = 30
+
+
+def _emit_stat(stat_key: str, value: float | None = None) -> None:
+    """Emit a counter or timing stat, silently ignoring missing app context.
+
+    Parameters
+    ----------
+    stat_key:
+        The metric name to increment or record.
+    value:
+        When ``None`` (default) a counter (``incr``) is emitted.  When a
+        float is supplied a timing value in milliseconds (``timing``) is
+        emitted instead.
+
+    This helper is used by :func:`inflight_guard` to expose observability
+    metrics that let operators distinguish between two very different
+    outcomes that can both produce a "high dedupe hit rate":
+
+    * **Good outcome** – waiters coalesce on a single fast query; wait_ms
+      is small and overall dashboard latency drops proportionally.
+    * **Bad outcome** – waiters coalesce on a slow query (or one that times
+      out and triggers a takeover); wait_ms is large and end-to-end latency
+      is dominated by guard wait rather than DB query time.
+
+    Metric reference
+    ----------------
+    ``inflight_guard.deduped``
+        Counter incremented each time a thread coalesces instead of
+        executing its own query.  High values = high dedupe hit rate.
+    ``inflight_guard.wait_ms``
+        Timing (ms) of how long a coalesced thread actually blocked.
+        If this is comparable to the DB query duration, the guard is
+        adding wait time rather than saving work — investigate why the
+        winner is slow (check ``inflight_guard.timeout``).
+    ``inflight_guard.timeout``
+        Counter incremented when a waiter's ``event.wait()`` call times
+        out before the winner finishes.  Non-zero values mean the original
+        query is exceeding ``QUERY_INFLIGHT_TIMEOUT_S`` / the webserver
+        timeout.  High values combined with high latency → the guard is
+        adding wait time; reduce the timeout or optimise the underlying
+        query.
+    ``inflight_guard.takeover``
+        Counter incremented when a timeout-waiter successfully takes over
+        execution.  Each takeover means one extra query execution.  In
+        steady state this should be near zero; spikes indicate queries that
+        routinely exceed the guard timeout.
+    ``inflight_guard.lock_wait_ms``
+        Timing (ms) of how long a thread waited to acquire ``_inflight_lock``
+        during the initial first-vs-waiter classification step.  Under low
+        load this will be near zero.  Sustained values above ~1 ms indicate
+        high lock contention — many threads competing simultaneously for the
+        same lock — which is a signal that the per-process inflight table is
+        becoming a serialisation bottleneck and should be investigated (e.g.
+        by sharding keys or reducing dashboard request fan-out).
+    ``inflight_guard.winner_query_ms``
+        Timing (ms) of how long the winning (or takeover) thread spent inside
+        the guard — i.e. the actual query execution time from the guard's
+        perspective.  Compare with ``inflight_guard.wait_ms``:
+
+        * ``wait_ms ≈ winner_query_ms`` → guard is working correctly; waiters
+          blocked for roughly the same duration as the query took.  If overall
+          latency is still not improving, the query itself is the bottleneck —
+          optimise the SQL or add a DB-side timeout.
+        * ``wait_ms ≪ winner_query_ms`` → waiters were released early (winner
+          finished quickly after the event fired); examine whether the cache
+          is warm and returning stale data.
+        * ``wait_ms ≫ winner_query_ms`` → waiters are somehow blocked longer
+          than the winner ran; check for lock contention (``lock_wait_ms``) or
+          OS-level scheduling pressure.
+
+    ``inflight_guard.cache_hit_after_wait``
+        Counter incremented (by the call site, not the guard itself) when a
+        waiter thread re-reads the cache after unblocking and finds data.
+        A high ratio of ``cache_hit_after_wait / deduped`` confirms that
+        deduplication is genuinely saving work: waiters received the winner's
+        result without executing their own query.
+    ``inflight_guard.cache_miss_after_wait``
+        Counter incremented (by the call site) when a waiter re-reads the
+        cache after unblocking but finds nothing.  This means the winner
+        failed or wrote an error sentinel, and the waiter still needs to
+        execute the query itself.  High values mean the guard is adding wait
+        time *without* saving DB work — investigate why the winner is failing
+        (check ``inflight_guard.timeout``, ``inflight_guard.takeover``, and
+        application error logs).
+
+    Diagnostic workflow — "high dedupe hit rate but latency not improving"
+    -----------------------------------------------------------------------
+    If ``inflight_guard.deduped`` is high but end-to-end latency has not
+    improved, use the following decision tree:
+
+    1. ``wait_ms ≈ winner_query_ms`` and ``cache_hit_after_wait`` high
+       → Guard is working correctly but the query itself is slow.
+         Optimise the SQL, add an index, or set a DB query timeout.
+
+    2. ``wait_ms ≈ timeout`` and ``timeout`` counter high
+       → Winner regularly exceeds ``QUERY_INFLIGHT_TIMEOUT_S``.
+         Lower the timeout or fix the slow query.  Every timeout produces
+         at least one takeover (extra query execution).
+
+    3. ``cache_miss_after_wait`` high
+       → Winner is failing before writing cache; waiters unblock, re-read
+         cache, find nothing, and execute the query themselves.  The guard
+         added wait time *and* didn't save any work.  Check error logs and
+         ``inflight_guard.takeover``.
+
+    4. ``lock_wait_ms`` high
+       → Lock contention is a bottleneck.  Many threads are competing for
+         ``_inflight_lock`` simultaneously.  Reduce dashboard fan-out (fewer
+         charts sharing the same key) or investigate why requests are arriving
+         in tight bursts.
+    """
+    try:
+        stats_logger = current_app.config["STATS_LOGGER"]
+        if value is None:
+            stats_logger.incr(stat_key)
+        else:
+            stats_logger.timing(stat_key, value)
+    except RuntimeError:
+        # No active Flask application context (e.g. unit tests that call
+        # inflight_guard directly without a Flask app).  Safe to ignore.
+        pass
+
+
+def _get_inflight_timeout() -> int:
+    """Return the configured inflight-guard wait timeout in seconds.
+
+    Reads ``QUERY_INFLIGHT_TIMEOUT_S`` from the Flask application config when
+    a request context is active.  Falls back to ``SUPERSET_WEBSERVER_TIMEOUT``
+    when ``QUERY_INFLIGHT_TIMEOUT_S`` is ``None`` (the default), and falls
+    back to the module-level ``_INFLIGHT_WAIT_TIMEOUT_S`` constant when there
+    is no Flask application context (e.g. unit tests).
+    """
+    try:
+        cfg = current_app.config
+        explicit = cfg.get("QUERY_INFLIGHT_TIMEOUT_S")
+        if explicit is not None:
+            return int(explicit)
+        return int(cfg.get("SUPERSET_WEBSERVER_TIMEOUT", _INFLIGHT_WAIT_TIMEOUT_S))
+    except RuntimeError:
+        # No active Flask application context (unit tests).
+        return _INFLIGHT_WAIT_TIMEOUT_S
+
+
+@contextmanager
+def inflight_guard(
+    cache_key: str | None,
+) -> Generator[bool, None, None]:
+    """Single-flight context manager for query execution.
+
+    Yields ``True`` (is_first) when the caller should execute the query.
+    Yields ``False`` when another thread is already executing the same query;
+    in this case the caller should wait (the wait happens inside the manager)
+    and then re-check the cache rather than executing a redundant query.
+
+    When *cache_key* is ``None`` (e.g. force_query mode or no key available)
+    the guard is a no-op and always yields ``True`` so the caller executes
+    unconditionally.
+
+    Security contract
+    -----------------
+    The guard coalesces concurrent threads that share the **exact same**
+    *cache_key*.  It is the **caller's responsibility** to pass a key that
+    already encodes all user-specific security context so that two threads
+    representing users with different data-access rights never share a key.
+
+    In practice this means callers must use the key produced by
+    ``QueryContextProcessor.query_cache_key()``, which folds in:
+
+    * **RLS predicates** – via ``security_manager.get_rls_cache_key()``,
+      resolved for the *current* Flask-request user.  A user with no RLS rules
+      gets an empty list; a user with RLS rules gets the list of applicable
+      filter clauses.  Different lists → different keys → different guards.
+    * **Jinja user-context** – via ``datasource.get_extra_cache_keys()``.
+      Template functions such as ``current_username()``, ``current_user_id()``,
+      and ``url_param()`` are evaluated at request time and appended to the
+      key, differentiating per-user filtered virtual datasets.
+    * **Impersonation identity** – when ``CACHE_IMPERSONATION``,
+      ``CACHE_QUERY_BY_USER``, or ``per_user_caching`` flags are active, the
+      database-level username is included so that impersonated sessions produce
+      distinct cache buckets.
+
+    Because of these inclusions, two requests for the same raw payload but
+    with different effective permissions will produce different cache keys and
+    therefore use independent guards.  The guard will **never** cause a
+    restricted user to receive data that was fetched in the context of a less-
+    restricted user.
+
+    Timeout and takeover
+    --------------------
+    The wait timeout is read from the ``QUERY_INFLIGHT_TIMEOUT_S`` Flask
+    config key, falling back to ``SUPERSET_WEBSERVER_TIMEOUT``.  This keeps
+    the backend wait aligned with the HTTP deadline so threads do not outlive
+    the connections they serve.
+
+    When a waiter's timeout fires:
+
+    * The **first** waiter to notice atomically replaces the original event in
+      ``_inflight_events`` with a new one and becomes the "takeover" executor,
+      yielding ``True`` so the caller runs the query.
+    * All **other** waiters see the replacement event and wait for the takeover
+      executor to complete, then yield ``False`` so the caller re-reads cache.
+
+    This keeps concurrent executions at most 2 (original + one takeover)
+    regardless of the number of waiting threads, preventing the thundering herd
+    that would otherwise occur when all N−1 waiters time out simultaneously.
+
+    The original executor (Thread-1) only removes its **own** event from
+    ``_inflight_events`` on cleanup, so it cannot accidentally discard the
+    takeover thread's replacement event.
+
+    Usage::
+
+        with inflight_guard(cache_key) as is_first:
+            if not is_first:
+                cache = QueryCacheManager.get(key=cache_key, ...)
+            if is_first or not cache.is_loaded:
+                query_result = run_expensive_query()
+                cache.set_query_result(key=cache_key, ...)
+    """
+    if not cache_key:
+        yield True
+        return
+
+    timeout = _get_inflight_timeout()
+
+    # --- Observability: lock contention ----------------------------------------
+    # Time how long it takes to acquire _inflight_lock.  Under low load this is
+    # near-instantaneous; sustained values above ~1 ms indicate many threads
+    # competing simultaneously and the lock becoming a bottleneck.
+    _lock_start = time.monotonic()
+    with _inflight_lock:
+        _emit_stat(
+            "inflight_guard.lock_wait_ms",
+            (time.monotonic() - _lock_start) * 1000,
+        )
+        if cache_key in _inflight_events:
+            event = _inflight_events[cache_key]
+            is_first = False
+        else:
+            event = threading.Event()
+            _inflight_events[cache_key] = event
+            is_first = True
+
+    if not is_first:
+        logger.debug(
+            "Single-flight: waiting for in-flight query with cache key: %s", cache_key
+        )
+        # --- Observability: dedupe hit ----------------------------------------
+        # Count every thread that coalesces instead of executing its own query.
+        # Pair with wait_ms below to distinguish "guard saved work" (low wait_ms)
+        # from "guard just added latency" (wait_ms ≈ full query duration).
+        _emit_stat("inflight_guard.deduped")
+        _wait_start = time.monotonic()
+        was_set = event.wait(timeout=timeout)
+        # Emit how long this thread actually blocked regardless of outcome.
+        _emit_stat("inflight_guard.wait_ms", (time.monotonic() - _wait_start) * 1000)
+
+        if not was_set:
+            # The wait timed out: the original executor is still running.
+            # Race all timeout-waiters: the FIRST to win the lock atomically
+            # replaces the original event and becomes the new executor.
+            # All losers discover the replacement and wait for the winner.
+            # --- Observability: timeout ----------------------------------------
+            # A non-zero timeout counter means the original query is exceeding
+            # QUERY_INFLIGHT_TIMEOUT_S.  High timeouts + high latency → the
+            # guard is adding wait time; reduce the timeout or fix the query.
+            _emit_stat("inflight_guard.timeout")
+            logger.warning(
+                "Single-flight: guard timed out after %ss for cache key '%s'. "
+                "Original query is still running. "
+                "One waiter will take over; others will wait for the takeover.",
+                timeout,
+                cache_key,
+            )
+            with _inflight_lock:
+                if _inflight_events.get(cache_key) is event:
+                    # We are the takeover winner: install a fresh event.
+                    takeover_event = threading.Event()
+                    _inflight_events[cache_key] = takeover_event
+                    is_takeover = True
+                else:
+                    # Another thread already took over; wait for it.
+                    is_takeover = False
+                    current_event = _inflight_events.get(cache_key)
+
+            if is_takeover:
+                # --- Observability: takeover -----------------------------------
+                # Each takeover = one extra query execution beyond the original.
+                # In steady state this should be near zero; spikes indicate
+                # queries routinely exceeding the guard timeout.
+                _emit_stat("inflight_guard.takeover")
+                logger.warning(
+                    "Single-flight: this thread is taking over execution "
+                    "for cache key '%s'.",
+                    cache_key,
+                )
+                try:
+                    # --- Observability: takeover query duration ----------------
+                    # Time how long this takeover thread spends executing so
+                    # operators can compare winner_query_ms with wait_ms.
+                    _takeover_start = time.monotonic()
+                    yield True
+                finally:
+                    _emit_stat(
+                        "inflight_guard.winner_query_ms",
+                        (time.monotonic() - _takeover_start) * 1000,
+                    )
+                    with _inflight_lock:
+                        if _inflight_events.get(cache_key) is takeover_event:
+                            _inflight_events.pop(cache_key, None)
+                    takeover_event.set()
+                return
+
+            # Not the takeover winner: wait for the takeover thread.
+            if current_event is not None:
+                current_event.wait(timeout=timeout)
+
+        yield False
+        return
+
+    # We are the first thread for this cache key.
+    try:
+        # --- Observability: winner query duration ------------------------------
+        # Time how long the first (winning) thread spends inside the guard.
+        # Compare with inflight_guard.wait_ms to answer: "are waiters blocking
+        # for as long as the query actually takes?"  If wait_ms ≈ winner_query_ms
+        # the guard is behaving correctly; if latency is still high, the query
+        # itself is the bottleneck.
+        _winner_start = time.monotonic()
+        yield True
+    finally:
+        _emit_stat(
+            "inflight_guard.winner_query_ms",
+            (time.monotonic() - _winner_start) * 1000,
+        )
+        # Only remove OUR event – a concurrent takeover may have already
+        # replaced it with a new one that other threads are waiting on.
+        with _inflight_lock:
+            if _inflight_events.get(cache_key) is event:
+                _inflight_events.pop(cache_key, None)
+        event.set()
 
 
 class QueryCacheManager:
@@ -165,6 +602,21 @@ class QueryCacheManager:
             return query_cache
 
         if cache_value := _cache[region].get(key):
+            # Detect an error sentinel written by a failed winner thread.
+            # Setting is_loaded=True signals callers to skip re-execution;
+            # status=FAILED and error_message tell them to surface the error.
+            if "__error__" in cache_value:
+                query_cache.error_message = cache_value["__error__"]
+                query_cache.status = QueryStatus.FAILED
+                query_cache.is_loaded = True
+                query_cache.is_cached = True
+                logger.debug(
+                    "Inflight guard: error sentinel hit for key %s – "
+                    "returning cached failure without re-executing",
+                    key,
+                )
+                return query_cache
+
             logger.debug("Cache key: %s", key)
             # Log cache hit for debugging
             logger.debug("CACHE GET - Key: %s, Region: %s", key, region)
@@ -209,6 +661,34 @@ class QueryCacheManager:
             )
             raise CacheLoadError("Error loading data from cache")
         return query_cache
+
+    @classmethod
+    def set_error_sentinel(
+        cls,
+        key: str,
+        error_message: str,
+        region: CacheRegion = CacheRegion.DATA,
+    ) -> None:
+        """Write a short-lived error marker to the shared cache backend.
+
+        Called by the winner thread of ``inflight_guard`` when a query fails,
+        so that threads blocked on the same cache key can read the failure
+        result immediately instead of all re-executing the same failing query.
+
+        Sentinels are stored as ``{"__error__": <message>}`` and expire after
+        ``_ERROR_SENTINEL_TTL_S`` seconds.  The short TTL ensures that
+        transient failures (e.g. brief DB unavailability) do not suppress
+        later successful queries for longer than necessary.
+
+        Recognised by ``QueryCacheManager.get()`` via the ``"__error__"`` key.
+        """
+        if key and _cache.get(region):
+            cls.set(
+                key=key,
+                value={"__error__": error_message},
+                timeout=_ERROR_SENTINEL_TTL_S,
+                region=region,
+            )
 
     @staticmethod
     def set(

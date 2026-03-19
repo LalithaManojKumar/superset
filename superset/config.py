@@ -188,6 +188,24 @@ DEFAULT_TIME_FILTER = utils.NO_TIME_RANGE
 # (gunicorn, nginx, apache, ...) timeout setting to be <= to this setting
 SUPERSET_WEBSERVER_TIMEOUT = int(timedelta(minutes=1).total_seconds())
 
+# Maximum seconds a thread will wait inside inflight_guard (the single-flight
+# deduplication mechanism for chart queries) before it gives up waiting for
+# the first thread and becomes the new executor itself.
+#
+# Why this matters:
+#   The frontend aborts HTTP requests instantly when a user changes a filter
+#   (via AbortController), but the corresponding backend threads continue
+#   blocking inside inflight_guard for this many seconds before retrying.
+#   If QUERY_INFLIGHT_TIMEOUT_S is much larger than the actual query runtime
+#   or the web-server deadline, threads pile up holding DB connections and
+#   thread-pool slots for requests that nobody will read.
+#
+# Recommendation: set this to a value slightly less than
+# SUPERSET_WEBSERVER_TIMEOUT so that backend threads do not outlive the HTTP
+# connections they are serving.  The default of None means the value of
+# SUPERSET_WEBSERVER_TIMEOUT is used at runtime.
+QUERY_INFLIGHT_TIMEOUT_S: int | None = None
+
 # this 2 settings are used by dashboard period force refresh feature
 # When user choose auto force refresh frequency
 # < SUPERSET_DASHBOARD_PERIODICAL_REFRESH_LIMIT

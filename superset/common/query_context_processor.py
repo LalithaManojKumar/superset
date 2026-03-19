@@ -27,7 +27,7 @@ from flask_babel import gettext as _
 from superset.common.chart_data import ChartDataResultFormat
 from superset.common.db_query_status import QueryStatus
 from superset.common.query_actions import get_query_results
-from superset.common.utils.query_cache_manager import QueryCacheManager
+from superset.common.utils.query_cache_manager import inflight_guard, QueryCacheManager
 from superset.common.utils.time_range_utils import get_since_until_from_time_range
 from superset.constants import CACHE_DISABLED_TIMEOUT, CacheRegion
 from superset.daos.annotation_layer import AnnotationLayerDAO
@@ -49,6 +49,7 @@ from superset.utils.core import (
     GenericDataType,
     get_column_names_from_columns,
     get_column_names_from_metrics,
+    get_stacktrace,
     is_adhoc_column,
     is_adhoc_metric,
 )
@@ -111,37 +112,97 @@ class QueryContextProcessor:
             cache.is_loaded = False
 
         if query_obj and cache_key and not cache.is_loaded:
-            try:
-                if invalid_columns := [
-                    col
-                    for col in get_column_names_from_columns(query_obj.columns)
-                    + get_column_names_from_metrics(query_obj.metrics or [])
-                    if (
-                        col not in self._qc_datasource.column_names
-                        and col != DTTM_ALIAS
+            # Single-flight guard: when multiple threads see the same cache miss
+            # concurrently (e.g. N charts in a dashboard sharing the same query),
+            # only the first thread executes the SQL query.  All others wait for
+            # the Event to be signalled and then re-read the result from cache.
+            # On force_query the guard is a no-op so each refresh executes fresh.
+            # guard_key=None bypasses the guard for force_query (explicit refresh
+            # requested by the user should never be coalesced with other requests).
+            guard_key = None if force_query else cache_key
+            with inflight_guard(guard_key) as is_first:
+                if not is_first:
+                    # Re-read cache populated by the first thread.
+                    cache = QueryCacheManager.get(
+                        key=cache_key,
+                        region=CacheRegion.DATA,
+                        force_query=False,
+                        force_cached=force_cached,
                     )
-                ]:
-                    raise QueryObjectValidationError(
-                        _(
-                            "Columns missing in dataset: %(invalid_columns)s",
-                            invalid_columns=invalid_columns,
-                        )
-                    )
+                    # --- Observability: dedupe effectiveness -------------------
+                    # Emit whether the wait paid off.  A high ratio of
+                    # cache_hit_after_wait / deduped means deduplication is
+                    # genuinely saving work.  A high cache_miss_after_wait
+                    # means the winner failed before writing cache, so waiters
+                    # blocked AND still need to re-execute — pure added latency.
+                    _stats_logger = current_app.config.get("STATS_LOGGER")
+                    if _stats_logger is not None:
+                        if cache.is_loaded:
+                            _stats_logger.incr("inflight_guard.cache_hit_after_wait")
+                        else:
+                            _stats_logger.incr("inflight_guard.cache_miss_after_wait")
 
-                query_result = self.get_query_result(query_obj)
-                annotation_data = self.get_annotation_data(query_obj)
-                cache.set_query_result(
-                    key=cache_key,
-                    query_result=query_result,
-                    annotation_data=annotation_data,
-                    force_query=force_query,
-                    timeout=self.get_cache_timeout(),
-                    datasource_uid=self._qc_datasource.uid,
-                    region=CacheRegion.DATA,
-                )
-            except QueryObjectValidationError as ex:
-                cache.error_message = str(ex)
-                cache.status = QueryStatus.FAILED
+                if is_first or not cache.is_loaded:
+                    try:
+                        if invalid_columns := [
+                            col
+                            for col in get_column_names_from_columns(query_obj.columns)
+                            + get_column_names_from_metrics(query_obj.metrics or [])
+                            if (
+                                col not in self._qc_datasource.column_names
+                                and col != DTTM_ALIAS
+                            )
+                        ]:
+                            raise QueryObjectValidationError(
+                                _(
+                                    "Columns missing in dataset: %(invalid_columns)s",
+                                    invalid_columns=invalid_columns,
+                                )
+                            )
+
+                        query_result = self.get_query_result(query_obj)
+                        annotation_data = self.get_annotation_data(query_obj)
+                        cache.set_query_result(
+                            key=cache_key,
+                            query_result=query_result,
+                            annotation_data=annotation_data,
+                            force_query=force_query,
+                            timeout=self.get_cache_timeout(),
+                            datasource_uid=self._qc_datasource.uid,
+                            region=CacheRegion.DATA,
+                        )
+                    except QueryObjectValidationError as ex:
+                        cache.error_message = str(ex)
+                        cache.status = QueryStatus.FAILED
+                        # Notify waiting threads of this deterministic failure
+                        # via a short-lived sentinel so they return the error
+                        # without re-executing the same query.
+                        if cache_key and not force_query:
+                            QueryCacheManager.set_error_sentinel(
+                                key=cache_key,
+                                error_message=cache.error_message,
+                                region=CacheRegion.DATA,
+                            )
+                    except Exception as ex:  # pylint: disable=broad-except
+                        # Catch-all for unexpected errors (DB connection lost,
+                        # driver exceptions, etc.) so the inflight_guard event
+                        # is always fired cleanly by its own finally block and
+                        # waiting threads are never left orphaned.
+                        cache.error_message = error_msg_from_exception(ex)
+                        cache.status = QueryStatus.FAILED
+                        cache.stacktrace = get_stacktrace()
+                        logger.exception(
+                            "Unexpected error executing query for cache key %s",
+                            cache_key,
+                        )
+                        # Write a sentinel so waiters see this failure and skip
+                        # re-execution rather than all hitting the same DB error.
+                        if cache_key and not force_query:
+                            QueryCacheManager.set_error_sentinel(
+                                key=cache_key,
+                                error_message=cache.error_message,
+                                region=CacheRegion.DATA,
+                            )
 
         # the N-dimensional DataFrame has converted into flat DataFrame
         # by `flatten operator`, "comma" in the column is escaped by `escape_separator`
@@ -213,8 +274,45 @@ class QueryContextProcessor:
         }
 
     def query_cache_key(self, query_obj: QueryObject, **kwargs: Any) -> str | None:
-        """
-        Returns a QueryObject cache key for objects in self.queries
+        """Return a security-scoped cache key for *query_obj*.
+
+        The key encodes **all** factors that affect what data a specific user
+        is allowed to see, so that two requests with different effective
+        permissions always produce distinct keys and therefore never share
+        cached results.
+
+        User-context factors included in the key
+        -----------------------------------------
+        rls (Row-Level Security predicates)
+            ``security_manager.get_rls_cache_key(datasource)`` returns the RLS
+            filter clauses that apply to the **current** Flask-request user,
+            including both regular RLS rules (scoped by role) and guest-token
+            RLS rules for embedded analytics.  Users with no matching RLS rules
+            receive an empty list; users with different rules receive different
+            lists — and therefore different cache keys.
+
+        extra_cache_keys (Jinja template user-context)
+            ``datasource.get_extra_cache_keys()`` evaluates any Jinja template
+            calls in the datasource SQL (e.g. ``{{ current_username() }}``,
+            ``{{ current_user_id() }}``, ``{{ url_param(...) }}``) and appends
+            their resolved values to the key.  This ensures datasets that
+            filter on the calling user produce per-user cache entries.
+
+        impersonation_key (database-level user identity)
+            When the ``CACHE_IMPERSONATION``, ``CACHE_QUERY_BY_USER``, or
+            ``per_user_caching`` (database extra) options are active,
+            ``query_obj.cache_key()`` appends the database-level username so
+            that per-user impersonation produces separate cache buckets.
+
+        When two requests share a key
+        ------------------------------
+        Two requests share a key only when all of the above factors are
+        identical — meaning the users have the same RLS rules, the same
+        resolved Jinja context, and (if impersonation is active) the same
+        database identity.  In that case they are entitled to see the exact
+        same data, so sharing a cached result is both safe and correct.  This
+        is also the only scenario where ``inflight_guard`` will coalesce them
+        into a single database round-trip.
         """
         datasource = self._qc_datasource
         extra_cache_keys = datasource.get_extra_cache_keys(query_obj.to_dict())
@@ -308,8 +406,35 @@ class QueryContextProcessor:
 
         totals_query = self._query_context.queries[totals_idx]
 
-        result = self._query_context.get_query_result(totals_query)
-        df = result.df
+        # Use cache to avoid re-executing the totals query when get_df_payload()
+        # later processes the same query. On a cache hit the database is not touched;
+        # on a cache miss the result is stored so the subsequent get_df_payload() call
+        # can read it from cache instead of hitting the database a second time.
+        cache_key = self.query_cache_key(totals_query)
+        timeout = self.get_cache_timeout()
+        force_query = self._query_context.force or timeout == CACHE_DISABLED_TIMEOUT
+        cache = QueryCacheManager.get(
+            key=cache_key,
+            region=CacheRegion.DATA,
+            force_query=force_query,
+        )
+
+        if cache.is_loaded:
+            df = cache.df
+        else:
+            query_result = self.get_query_result(totals_query)
+            if cache_key:
+                cache.set_query_result(
+                    key=cache_key,
+                    query_result=query_result,
+                    force_query=force_query,
+                    timeout=timeout,
+                    datasource_uid=self._qc_datasource.uid,
+                    region=CacheRegion.DATA,
+                )
+                df = cache.df
+            else:
+                df = query_result.df
 
         totals = {
             col: df[col].sum() for col in df.columns if df[col].dtype.kind in "biufc"
@@ -350,15 +475,27 @@ class QueryContextProcessor:
                 )
             ]
 
-        query_results = [
-            get_query_results(
-                query_obj.result_type or self._query_context.result_type,
-                self._query_context,
-                query_obj,
-                force_cached,
-            )
-            for query_obj in self._query_context.queries
-        ]
+        # Deduplicate queries with the same cache key to avoid executing the same
+        # database query more than once within a single payload computation.
+        seen_results: dict[str, Any] = {}
+        query_results = []
+        for query_obj in self._query_context.queries:
+            cache_key = self.query_cache_key(query_obj)
+            if cache_key and cache_key in seen_results:
+                logger.debug(
+                    "Reusing result for duplicate query with cache key: %s", cache_key
+                )
+                query_results.append(seen_results[cache_key])
+            else:
+                result = get_query_results(
+                    query_obj.result_type or self._query_context.result_type,
+                    self._query_context,
+                    query_obj,
+                    force_cached,
+                )
+                if cache_key:
+                    seen_results[cache_key] = result
+                query_results.append(result)
 
         return_value = {"queries": query_results}
 
